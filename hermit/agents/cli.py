@@ -1,4 +1,4 @@
-"""The `codex`, `claude-code`, and `pi` agents: one task run by the agent CLI in a workspace the adapter is deployed into.
+"""The `codex`, `claude-code` and `pi` agents: one task run by the agent CLI in a workspace the adapter is deployed into.
 
     agent:
       name: codex                            # or claude-code or pi; `cli` with params.backend is the same
@@ -22,8 +22,9 @@ would (AGENTS.md or CLAUDE.md, the MCP server, skills, roles), the prompt is giv
 the agent's last message is the output. The workspace is the log: it keeps the agent's JSON event stream, the
 deployment and whatever the agent wrote. Usage is read from the event stream, as the AgentEvolver reads it.
 
-`pi` runs `pi --mode json --approve` so project `.pi/` resources are trusted for that process without writing
-`~/.pi/agent/trust.json`. Adapters that export roles still fail with the error from `hermit.hosts.pi.prepare`.
+`pi` is given the prompt in JSON mode, not print mode: it runs `pi --mode json --approve [--model M] [args] -- PROMPT`,
+so project `.pi/` resources are trusted for that process without writing `~/.pi/agent/trust.json`. Adapters that
+export roles still fail with the error from `hermit.hosts.pi.prepare`.
 """
 from __future__ import annotations
 
@@ -81,10 +82,9 @@ def command(backend: str, prompt: str, workspace: Path, params: dict, last_messa
                 *(["-m", model] if model else []), *args, prompt]
     if backend == "pi":
         provider = params.get("pi_provider")
-        if provider:
-            return ["pi", "--mode", "json", "--approve", "--provider", provider["name"], "--model", model,
-                    *args, prompt]
-        return ["pi", "--mode", "json", "--approve", *(["--model", model] if model else []), *args, prompt]
+        selected = ["--provider", provider["name"], "--model", model] if provider else (["--model", model] if model else [])
+        # `--` ends option parsing, so a prompt that begins with `-` is a prompt and not an unknown option.
+        return ["pi", "--mode", "json", "--approve", *selected, *args, "--", prompt]
     return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--permission-mode", params.get("claude_permission_mode", "bypassPermissions"),
             *(["--model", model] if model else []), *args]
@@ -100,13 +100,13 @@ def last_message(backend: str, log: Path, last: Path) -> str:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("type") != "message_end":
+            message = event.get("message") if isinstance(event, dict) and event.get("type") == "message_end" else None
+            if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
-            message = event.get("message") or {}
-            if message.get("role") != "assistant":
-                continue
-            blocks = [b.get("text", "") for b in message.get("content") or [] if b.get("type") == "text"]
-            text = "".join(blocks)
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else []
+            text = "".join(b["text"] for b in blocks
+                           if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
         return text
     text = ""
     for line in log.read_text(errors="replace").splitlines():
