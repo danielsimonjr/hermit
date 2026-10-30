@@ -8,6 +8,8 @@ Changes are grouped by software version. Entries under Unreleased describe work 
 
 - The `pi` acting agent runs `pi --mode json --approve` in a deployed workspace (`agent.name: pi` or `agent.name: cli`
   with `params.backend: pi`).
+- Pi JSONL event streams fill `RunOutput` tokens, cost, and `api_speed["model_calls"]` the same way Codex and Claude
+  Code do.
 
 ### Breaking
 
