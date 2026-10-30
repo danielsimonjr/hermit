@@ -117,7 +117,7 @@ echo '{"type":"session","id":"ps1","cwd":"/tmp"}'
 echo '{"type":"message_update","usage":{"input":99999}}'
 echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"draft"},{"type":"thinking","thinking":"x"}],"usage":{"input":10,"output":4,"cacheRead":3,"cacheWrite":1,"reasoning":2,"cost":{"total":0.01}}}}'
 echo '{"type":"message_end","message":{"role":"toolResult","usage":{"input":100,"output":50,"cacheRead":0,"cost":{"total":9}}}}'
-echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],"usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.02}}}}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"ANSWER 44"}],"usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.02}}}}'
 '''
 
 
@@ -129,7 +129,7 @@ def _isolated_home(tmp_path, monkeypatch, name="home"):
     if user_site:
         monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
     home = tmp_path / name
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
     return home
 
@@ -253,33 +253,26 @@ def test_cli_rejects_an_unknown_backend(tmp_path):
     assert not (tmp_path / ".logs").exists()
 
 
-def _pi_run(tmp_path, monkeypatch, params=None):
-    import site
-    from test_convert import variant
-
+def _fake_pi_on_path(tmp_path, monkeypatch, script=FAKE_PI):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     exe = bin_dir / "pi"
-    exe.write_text(FAKE_PI)
+    exe.write_text(script)
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    user_site = site.getusersitepackages()
-    if user_site:
-        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    adapter_root = tmp_path / "pi_adapter"
-    adapter_dir = adapter_root / "adapter"
-    if not adapter_dir.is_dir():
-        adapter = variant(adapter_root, roles=False)
-    else:
-        adapter = adapter_dir
-    home = tmp_path / "home"
-    home.mkdir(exist_ok=True)
-    monkeypatch.setenv("HOME", str(home))
+
+
+def _pi_run(tmp_path, monkeypatch, params=None):
+    from test_convert import variant
+
+    _fake_pi_on_path(tmp_path, monkeypatch)
+    _isolated_home(tmp_path, monkeypatch)
+    adapter = tmp_path / "pi_adapter" / "adapter"
+    if not adapter.is_dir():
+        variant(tmp_path / "pi_adapter", roles=False)
     (tmp_path / "prompt.md").write_text("Solve {question}.")
-    base_params = {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", "model": "m1"}
-    if params:
-        base_params.update(params)
-    run = load_pipeline("hermit.agents.cli:run", tmp_path, base_params)
+    run = load_pipeline("hermit.agents.cli:run", tmp_path,
+                        {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", "model": "m1", **(params or {})})
     return run({"id": "q7", "question": "6*7"}, adapter)
 
 
@@ -312,20 +305,19 @@ def test_parse_log_pi_ignores_snapshots_reasoning_and_tool_usage(tmp_path):
     u = usage[0]
     assert u.calls == 2 and u.output_tokens == 9
     assert u.input_tokens == 33 and u.cached_input_tokens == 3
+    assert u.cost_usd == pytest.approx(0.03)                  # the tool result's 9 is nested work, not this call
+    assert not [name for name in vars(u) if "write" in name]  # Usage has nowhere to put cacheWrite
 
 
-def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch):
-    slow = FAKE_PI.replace("#!/bin/sh", "#!/bin/sh\nsleep 2")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    exe = bin_dir / "pi"
-    exe.write_text(slow)
-    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+@pytest.mark.parametrize("script", [FAKE_PI.replace("#!/bin/sh", "#!/bin/sh\nsleep 2"),
+                                    "#!/bin/sh\nprintf '{\"type\":'\nsleep 2\n"], ids=["empty-log", "truncated-line"])
+def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch, script):
+    _fake_pi_on_path(tmp_path, monkeypatch, script)
     run = load_pipeline("hermit.agents.cli:run", tmp_path,
-                         {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
+                        {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
     out = run({"id": "t1"}, None)
     assert out.extra["exit_code"] == -1 and out.extra["timed_out"] is True
+    assert out.output == "" and out.tokens is None and out.cost_usd is None
 
 
 def test_parse_log_pi_skips_a_truncated_line(tmp_path):
@@ -336,12 +328,28 @@ def test_parse_log_pi_skips_a_truncated_line(tmp_path):
     log.write_text(
         '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],'
         '"usage":{"input":20,"output":5,"cacheRead":0,"cost":{"total":0.02}}}}\n'
+        "42\n"                     # JSON, but no record: stderr shares this file
         "{\n"
     )
     _, usage = parse_log(log, "pi", "m")
     assert usage[0].output_tokens == 5
+    assert last_message("pi", log, tmp_path / ".last") == "ANSWER 44"
     empty = tmp_path / "empty.jsonl"
     empty.write_text("")
     assert parse_log(empty, "pi", "m") == (None, [])
     assert last_message("pi", empty, tmp_path / ".last") == ""
 
+
+def test_last_message_pi_is_the_text_of_the_last_assistant_message(tmp_path):
+    from hermit.agents.cli import last_message
+
+    log = tmp_path / "agent-pi.jsonl"
+    text = '{"type":"message_end","message":{"role":"assistant","content":[%s]}}\n'
+    log.write_text(text % '{"type":"text","text":"a"},{"type":"thinking","thinking":"x"},{"type":"text","text":"b"}')
+    assert last_message("pi", log, tmp_path / ".last") == "ab"              # joined with no separator
+    with log.open("a") as out:
+        out.write('{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"tool"}]}}\n')
+    assert last_message("pi", log, tmp_path / ".last") == "ab"              # a tool result is not the answer
+    with log.open("a") as out:
+        out.write(text % '{"type":"toolCall","id":"c1","name":"bash","arguments":{}}')
+    assert last_message("pi", log, tmp_path / ".last") == ""                # the last message has no text block

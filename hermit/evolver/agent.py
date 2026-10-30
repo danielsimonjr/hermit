@@ -189,11 +189,13 @@ def parse_log(log: Path, backend: str, model: str) -> tuple[str | None, list[Usa
                 usage.output_tokens += int(u.get("output_tokens", 0))
                 usage.calls += 1
         elif backend == "pi":
+            if not isinstance(event, dict):         # stderr shares the log: a line can be JSON and still no record
+                continue
             if event.get("type") == "session":
                 session = event.get("id") or session
             if event.get("type") == "message_end":
-                message = event.get("message") or {}
-                if message.get("role") != "assistant":
+                message = event.get("message")
+                if not isinstance(message, dict) or message.get("role") != "assistant":
                     continue
                 u = message.get("usage") or {}
                 usage.input_tokens += int(u.get("input", 0)) + int(u.get("cacheRead", 0))

@@ -88,4 +88,3 @@ reproductions and the OfficeQA Flash row.
 - Offline and real-model tutorials, benchmark recipes, and a finished Lean collaboration adapter example.
 
 Consult each recipe and adapter card for its evaluation protocol and observed results.
-
