@@ -112,7 +112,11 @@ echo '{"type":"result","result":"ANSWER 43","num_turns":3,"total_cost_usd":0.5,"
 '''
 FAKE_PI = '''#!/bin/sh
 printf '%s\\n' "$*" > .args
-echo '{"type":"result","result":"ANSWER 44"}'
+echo '{"type":"session","id":"ps1","cwd":"/tmp"}'
+echo '{"type":"message_update","usage":{"input":99999}}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"draft"},{"type":"thinking","thinking":"x"}],"usage":{"input":10,"output":4,"cacheRead":3,"cacheWrite":1,"reasoning":2,"cost":{"total":0.01}}}}'
+echo '{"type":"message_end","message":{"role":"toolResult","usage":{"input":100,"output":50,"cacheRead":0,"cost":{"total":9}}}}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],"usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.02}}}}'
 '''
 
 
@@ -242,4 +246,97 @@ def test_cli_rejects_an_unknown_backend(tmp_path):
     msg = str(exc.value)
     assert "codex" in msg and "pi" in msg
     assert not (tmp_path / ".logs").exists()
+
+
+def _pi_run(tmp_path, monkeypatch, params=None):
+    import site
+    from test_convert import variant
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / "pi"
+    exe.write_text(FAKE_PI)
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    user_site = site.getusersitepackages()
+    if user_site:
+        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    adapter_root = tmp_path / "pi_adapter"
+    adapter_dir = adapter_root / "adapter"
+    if not adapter_dir.is_dir():
+        adapter = variant(adapter_root, roles=False)
+    else:
+        adapter = adapter_dir
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    (tmp_path / "prompt.md").write_text("Solve {question}.")
+    base_params = {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", "model": "m1"}
+    if params:
+        base_params.update(params)
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, base_params)
+    return run({"id": "q7", "question": "6*7"}, adapter)
+
+
+def test_pi_jsonl_fills_output_tokens_and_cost(tmp_path, monkeypatch):
+    binding = {"ref": "vllm/q", "backend": "vllm", "model": "q", "base_url": "http://127.0.0.1:8000/v1",
+               "litellm": "hosted_vllm/q", "apis": ["chat"]}
+    out = _pi_run(tmp_path, monkeypatch, {"price": {"input": 1, "cached_input": 0.5, "output": 2}, "binding": binding})
+    assert out.output == "ANSWER 44"
+    assert out.tokens == 42 and out.api_speed["model_calls"] == 2
+    assert out.cost_usd == pytest.approx(((33 - 3) * 1 + 3 * 0.5 + 9 * 2) / 1e6)
+    out2 = _pi_run(tmp_path, monkeypatch)
+    assert out2.cost_usd == 0.03 and out2.tokens == 42
+
+
+def test_parse_log_pi_ignores_snapshots_reasoning_and_tool_usage(tmp_path):
+    from hermit.evolver.agent import parse_log
+
+    log = tmp_path / "agent-pi.jsonl"
+    log.write_text(
+        '{"type":"session","id":"ps1","cwd":"/tmp"}\n'
+        '{"type":"message_update","usage":{"input":99999}}\n'
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"draft"}],'
+        '"usage":{"input":10,"output":4,"cacheRead":3,"cacheWrite":1,"reasoning":2,"cost":{"total":0.01}}}}\n'
+        '{"type":"message_end","message":{"role":"toolResult","usage":{"input":100,"output":50,"cacheRead":0,"cost":{"total":9}}}}\n'
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],'
+        '"usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.02}}}}\n'
+    )
+    session, usage = parse_log(log, "pi", "m")
+    assert session == "ps1" and len(usage) == 1
+    u = usage[0]
+    assert u.calls == 2 and u.output_tokens == 9
+    assert u.input_tokens == 33 and u.cached_input_tokens == 3
+
+
+def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch):
+    slow = FAKE_PI.replace("#!/bin/sh", "#!/bin/sh\nsleep 2")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "pi"
+    exe.write_text(slow)
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    run = load_pipeline("hermit.agents.cli:run", tmp_path,
+                         {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
+    out = run({"id": "t1"}, None)
+    assert out.extra["exit_code"] == -1 and out.extra["timed_out"] is True
+
+
+def test_parse_log_pi_skips_a_truncated_line(tmp_path):
+    from hermit.agents.cli import last_message
+    from hermit.evolver.agent import parse_log
+
+    log = tmp_path / "agent-pi.jsonl"
+    log.write_text(
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],'
+        '"usage":{"input":20,"output":5,"cacheRead":0,"cost":{"total":0.02}}}}\n'
+        "{\n"
+    )
+    _, usage = parse_log(log, "pi", "m")
+    assert usage[0].output_tokens == 5
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("")
+    assert parse_log(empty, "pi", "m") == (None, [])
+    assert last_message("pi", empty, tmp_path / ".last") == ""
 

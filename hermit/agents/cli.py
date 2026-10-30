@@ -86,6 +86,21 @@ def command(backend: str, prompt: str, workspace: Path, params: dict, last_messa
 def last_message(backend: str, log: Path, last: Path) -> str:
     if backend == "codex":
         return last.read_text() if last.is_file() else ""
+    if backend == "pi":
+        text = ""
+        for line in log.read_text(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") != "message_end":
+                continue
+            message = event.get("message") or {}
+            if message.get("role") != "assistant":
+                continue
+            blocks = [b.get("text", "") for b in message.get("content") or [] if b.get("type") == "text"]
+            text = "".join(blocks)
+        return text
     text = ""
     for line in log.read_text(errors="replace").splitlines():
         try:
