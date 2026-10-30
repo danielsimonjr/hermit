@@ -1,7 +1,7 @@
-"""The `codex` and `claude-code` agents: one task run by the agent CLI in a workspace the adapter is deployed into.
+"""The `codex`, `claude-code` and `pi` agents: one task run by the agent CLI in a workspace the adapter is deployed into.
 
     agent:
-      name: codex                            # or claude-code; `cli` with params.backend is the same
+      name: codex                            # or claude-code or pi; `cli` with params.backend is the same
       params:
         model: gpt-5.4                       # optional: the CLI's default otherwise. A `<backend>/<model>` reference
                                              # (hermit.backends) binds the CLI to that backend: its provider
@@ -19,6 +19,10 @@ For every task a new workspace is created, the adapter is deployed into it exact
 would (AGENTS.md or CLAUDE.md, the MCP server, skills, roles), the prompt is given to the CLI in print mode, and
 the agent's last message is the output. The workspace is the log: it keeps the agent's JSON event stream, the
 deployment and whatever the agent wrote. Usage is read from the event stream, as the AgentEvolver reads it.
+
+`pi` is given the prompt in JSON mode, not print mode: it runs `pi --mode json --approve [--model M] [args] -- PROMPT`,
+so project `.pi/` resources are trusted for that process without writing `~/.pi/agent/trust.json`. Adapters that
+export roles still fail with the error from `hermit.hosts.pi.prepare`.
 """
 from __future__ import annotations
 
@@ -35,7 +39,7 @@ from hermit.agents.base import Agent
 from hermit.evolver.agent import parse_log, price_usage
 from hermit.task import RunOutput
 
-BACKENDS = ("codex", "claude")
+BACKENDS = ("codex", "claude", "pi")
 
 
 def _format(template: str, task: dict) -> str:
@@ -59,6 +63,8 @@ def _prompt(params: dict, base: Path, task: dict) -> str:
 def deploy(adapter: Path, workspace: Path, backend: str) -> dict:
     if backend == "codex":
         from hermit.hosts.codex import prepare
+    elif backend == "pi":
+        from hermit.hosts.pi import prepare
     else:
         from hermit.hosts.claude_code import prepare
     return prepare(adapter, workspace, sys.executable)
@@ -71,6 +77,9 @@ def command(backend: str, prompt: str, workspace: Path, params: dict, last_messa
         return ["codex", "exec", "--json", "--skip-git-repo-check", "-C", str(workspace),
                 "-s", params.get("codex_sandbox", "workspace-write"), "-o", str(last_message),
                 *(["-m", model] if model else []), *args, prompt]
+    if backend == "pi":
+        # `--` ends option parsing, so a prompt that begins with `-` is a prompt and not an unknown option.
+        return ["pi", "--mode", "json", "--approve", *(["--model", model] if model else []), *args, "--", prompt]
     return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--permission-mode", params.get("claude_permission_mode", "bypassPermissions"),
             *(["--model", model] if model else []), *args]

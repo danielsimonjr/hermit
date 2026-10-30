@@ -4,6 +4,11 @@ Changes are grouped by software version. Entries under Unreleased describe work 
 
 ## Unreleased
 
+### Added
+
+- The `pi` acting agent runs `pi --mode json --approve` in a deployed workspace (`agent.name: pi` or `agent.name: cli`
+  with `params.backend: pi`).
+
 ### Breaking
 
 - The adapter layout changed: a learner may change every file of an adapter except `.git/` and the metadata, and
