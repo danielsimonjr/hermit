@@ -26,6 +26,8 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install bubblewrap
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Verify user namespaces
         run: |
           bwrap --unshare-user --unshare-net --ro-bind / / true || bwrap --unshare-user --ro-bind / / true
