@@ -6,7 +6,9 @@
         model: gpt-5.4                       # optional: the CLI's default otherwise. A `<backend>/<model>` reference
                                              # (hermit.backends) binds the CLI to that backend: its provider
                                              # settings go into args (Codex) or env (Claude Code), its price is used
-                                             # (Claude Code's own cost figure only for Anthropic's backend)
+                                             # (Claude Code's own cost figure only for Anthropic's backend). For Pi, a
+                                             # reference writes a per-call models.json under PI_CODING_AGENT_DIR, not
+                                             # ~/.pi/agent.
         prompt: environment/prompt.md        # the task prompt; `{field}` placeholders take the task's fields
         files: [environment/fixtures]        # optional: copied into every workspace before the run
         args: []                             # extra CLI arguments
@@ -35,6 +37,7 @@ import time
 import uuid
 
 from hermit.agents.base import Agent
+from hermit.backends import PI_BUILTIN_PROVIDERS  # noqa: F401 — documented built-in Pi provider ids
 from hermit.evolver.agent import parse_log, price_usage
 from hermit.task import RunOutput
 
@@ -77,6 +80,10 @@ def command(backend: str, prompt: str, workspace: Path, params: dict, last_messa
                 "-s", params.get("codex_sandbox", "workspace-write"), "-o", str(last_message),
                 *(["-m", model] if model else []), *args, prompt]
     if backend == "pi":
+        provider = params.get("pi_provider")
+        if provider:
+            return ["pi", "--mode", "json", "--approve", "--provider", provider["name"], "--model", model,
+                    *args, prompt]
         return ["pi", "--mode", "json", "--approve", *(["--model", model] if model else []), *args, prompt]
     return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--permission-mode", params.get("claude_permission_mode", "bypassPermissions"),
@@ -140,6 +147,20 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
     prompt = _prompt(params, base, task)
     log, last = workspace / f"agent-{backend}.jsonl", workspace / ".last-message.txt"
     env = {**os.environ, **{k: os.path.expandvars(str(v)) for k, v in (params.get("env") or {}).items()}}
+    if backend == "pi":
+        agent_dir = env.get("PI_CODING_AGENT_DIR")
+        if not agent_dir:
+            agent_dir_path = workspace / ".pi-agent"
+            agent_dir_path.mkdir(parents=True, exist_ok=True)
+            agent_dir = str(agent_dir_path)
+        else:
+            agent_dir_path = Path(agent_dir)
+        env["PI_CODING_AGENT_DIR"] = agent_dir
+        provider = params.get("pi_provider")
+        if provider:
+            document = {provider["name"]: {"baseUrl": provider["baseUrl"], "api": provider["api"],
+                                            "apiKey": provider["apiKey"], "models": provider["models"]}}
+            (Path(agent_dir) / "models.json").write_text(json.dumps({"providers": document}))
     started = time.time()
     with open(log, "w") as out:
         try:

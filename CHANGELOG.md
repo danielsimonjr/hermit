@@ -10,6 +10,7 @@ Changes are grouped by software version. Entries under Unreleased describe work 
   with `params.backend: pi`).
 - Pi JSONL event streams fill `RunOutput` tokens, cost, and `api_speed["model_calls"]` the same way Codex and Claude
   Code do.
+- Pi model references bind into a per-call `models.json` under `PI_CODING_AGENT_DIR` (not `~/.pi/agent`).
 
 ### Breaking
 

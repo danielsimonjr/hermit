@@ -67,6 +67,24 @@ LITELLM_KEY_ENV = {"fireworks_ai": "FIREWORKS_AI_API_KEY", "openai": "OPENAI_API
                    "deepseek": "DEEPSEEK_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "ollama": "OLLAMA_API_KEY"}
 PLACEHOLDER_KEY = "local"      # sent to a server that needs no key, for clients that refuse to send none
 
+PI_BUILTIN_PROVIDERS = frozenset({"anthropic", "openai", "deepseek", "fireworks", "llama.cpp"})
+
+
+def pi_provider_name(backend_name: str) -> str:
+    return f"hermit-{backend_name}" if backend_name in PI_BUILTIN_PROVIDERS else backend_name
+
+
+def pi_api(apis) -> tuple[str, str] | None:
+    """Pi models.json `api` string and the dialect for problems_of / bindings_of."""
+    apis = tuple(apis or ())
+    if "chat" in apis:
+        return "openai-completions", "chat"
+    if "responses" in apis:
+        return "openai-responses", "responses"
+    if "messages" in apis:
+        return "anthropic-messages", "messages"
+    return None
+
 
 @dataclass
 class Backend:
@@ -254,7 +272,7 @@ class Binding:
         name = spec.get("backend") or (urlsplit(spec["base_url"]).hostname or "custom")
         backend = Backend(name=name, base_url=str(spec["base_url"]).rstrip("/"), api_key_env=spec.get("api_key_env"),
                           key_required=bool(spec.get("key_required", True)),
-                          apis=tuple(spec.get("apis") or ["chat"]), messages_url=spec.get("messages_url"),
+                          apis=tuple(spec["apis"] if "apis" in spec else (spec.get("apis") or ["chat"])), messages_url=spec.get("messages_url"),
                           litellm=(spec["litellm"].split("/", 1)[0] if spec.get("litellm") else None),
                           context_window=spec.get("context_window"))
         return cls(backend, str(spec["model"]), price=spec.get("price"), extra_body=dict(spec.get("extra_body") or {}))
@@ -369,10 +387,10 @@ def _spec_of(value, binding: Binding) -> dict:
 
 
 def bind_agent_params(params: dict, kind: str, backends: dict[str, Backend], default=None) -> dict:
-    """The params of a Codex (`kind` codex) or Claude Code (`kind` claude) agent or Evolver with its model bound:
-    `model` becomes the id the endpoint expects, the provider settings go into `args` (Codex) or `env` (Claude
-    Code) ahead of the user's own, `price` is filled from the backend, and `binding` records the whole. A `model`
-    that is no reference (the CLI's own provider) is left alone."""
+    """The params of a Codex (`kind` codex), Claude Code (`kind` claude), or Pi (`kind` pi) agent or Evolver with its
+    model bound: `model` becomes the id the endpoint expects, the provider settings go into `args` (Codex) or `env`
+    (Claude Code) or `pi_provider` (Pi) ahead of the user's own, `price` is filled from the backend, and `binding`
+    records the whole. A `model` that is no reference (the CLI's own provider) is left alone."""
     binding = as_binding(params.get("model") or default, backends)
     if binding is None:
         return params
@@ -382,8 +400,17 @@ def bind_agent_params(params: dict, kind: str, backends: dict[str, Backend], def
         out["args"] = [*binding.codex_args(), *(params.get("args") or [])]
     elif kind == "claude":
         out["env"] = {**binding.claude_env(), **(params.get("env") or {})}
+    elif kind == "pi":
+        pair = pi_api(binding.backend.apis)
+        if pair is not None:
+            api, _ = pair
+            key_env = binding.key_env_if_set()
+            api_key = f"${key_env}" if key_env else PLACEHOLDER_KEY
+            name = pi_provider_name(binding.backend.name)
+            out["pi_provider"] = {"name": name, "baseUrl": binding.base_url, "api": api, "apiKey": api_key,
+                                  "models": [{"id": binding.model}]}
     else:
-        raise ValueError(f"kind must be codex or claude, not {kind!r}")
+        raise ValueError(f"kind must be codex, claude, or pi, not {kind!r}")
     if not out.get("price"):
         out["price"] = binding.price
     out["binding"] = binding.spec()
@@ -392,12 +419,12 @@ def bind_agent_params(params: dict, kind: str, backends: dict[str, Backend], def
 
 # ---- the run config -------------------------------------------------------------------------------------------
 
-CLI_AGENTS = {"codex": "codex", "claude-code": "claude", "claude": "claude", "cli": None}
+CLI_AGENTS = {"codex": "codex", "claude-code": "claude", "claude": "claude", "pi": "pi", "cli": None}
 
 
 def normalize_config(data: dict) -> None:
     """Resolve the model references of a loaded run config in place: `llm` and `agent.params.model` become specs
-    (the top-level `model` is the default for both), a Codex or Claude Code acting agent gets its provider
+    (the top-level `model` is the default for both), a Codex, Claude Code, or Pi acting agent gets its provider
     settings. The Evolver's model is bound when the Evolver is instantiated (its kind is in its manifest)."""
     backends = registry(data.get("backends"))
     default = data.get("model")
@@ -417,11 +444,11 @@ def normalize_config(data: dict) -> None:
         params = {}
     kind = CLI_AGENTS.get(str(agent.get("name") or ""), "")
     if kind is None:                                        # `cli`: the backend is a param
-        kind = {"codex": "codex", "claude": "claude", "claude-code": "claude"}.get(params.get("backend", "codex"), "")
+        kind = {"codex": "codex", "claude": "claude", "claude-code": "claude", "pi": "pi"}.get(params.get("backend", "codex"), "")
     model = params.get("model")
     if model is None and default is not None:
         model = default
-    if model is not None and kind in ("codex", "claude"):
+    if model is not None and kind in ("codex", "claude", "pi"):
         params = bind_agent_params({**params, "model": model}, kind, backends)
     elif model is not None:
         binding = as_binding(model, backends)
@@ -445,9 +472,13 @@ def bindings_of(data: dict, evolver_params: dict | None = None) -> list[tuple[st
     params = agent.get("params") or {}
     kind = CLI_AGENTS.get(str(agent.get("name") or ""), "")
     if kind is None:
-        kind = {"codex": "codex", "claude": "claude", "claude-code": "claude"}.get(params.get("backend", "codex"), "")
+        kind = {"codex": "codex", "claude": "claude", "claude-code": "claude", "pi": "pi"}.get(params.get("backend", "codex"), "")
     if kind in ("codex", "claude") and isinstance(params.get("binding"), dict):
         out.append((f"agent ({agent['name']})", Binding.from_spec(params["binding"]), NEEDS[kind]))
+    elif kind == "pi" and isinstance(params.get("binding"), dict):
+        binding = Binding.from_spec(params["binding"])
+        dialect = pi_api(binding.backend.apis)
+        out.append((f"agent ({agent['name']})", binding, dialect[1] if dialect else "chat"))
     elif isinstance(params.get("model"), dict) and params["model"].get("base_url") and params["model"].get("model"):
         out.append((f"agent ({agent['name']})", Binding.from_spec(params["model"]), "chat"))
     if evolver_params and isinstance(evolver_params.get("binding"), dict):

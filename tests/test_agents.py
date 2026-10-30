@@ -323,7 +323,47 @@ def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch):
     assert out.extra["exit_code"] == -1 and out.extra["timed_out"] is True
 
 
-def test_parse_log_pi_skips_a_truncated_line(tmp_path):
+def test_pi_models_json_uses_a_private_agent_dir(tmp_path, monkeypatch):
+    import site
+    from test_backends import GLM, reg
+    from test_convert import variant
+    from hermit.backends import bind_agent_params
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sekret")
+    bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
+    script = FAKE_PI.replace("#!/bin/sh", '#!/bin/sh\necho "$PI_CODING_AGENT_DIR" > .pi-dir')
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "pi").write_text(script)
+    (bin_dir / "pi").chmod(stat.S_IEXEC | stat.S_IRUSR | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    user_site = site.getusersitepackages()
+    if user_site:
+        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    adapter_root = tmp_path / "pi_adapter"
+    adapter = variant(adapter_root, roles=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (tmp_path / "prompt.md").write_text("Solve {question}.")
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws",
+                                                             **bound})
+    out = run({"id": "q7", "question": "6*7"}, adapter)
+    ws = out.log
+    agent_dir = ws / ".pi-agent"
+    models = json.loads((agent_dir / "models.json").read_text())
+    assert agent_dir.is_dir() and not (home / ".pi").exists()
+    prov = bound["pi_provider"]
+    assert models["providers"][prov["name"]]["apiKey"] == "$FIREWORKS_API_KEY"
+    args = (ws / ".args").read_text()
+    assert "--provider" in args and prov["name"] in args and "--model" in args and GLM in args
+    assert "--api-key" not in args and "sekret" not in args
+    first_dir = agent_dir.resolve()
+    out2 = run({"id": "q8", "question": "6*7"}, adapter)
+    second_dir = (out2.log / ".pi-agent").resolve()
+    assert second_dir != first_dir
+    assert not first_dir.joinpath("models.json").samefile(second_dir / "models.json")
+
     from hermit.agents.cli import last_message
     from hermit.evolver.agent import parse_log
 
