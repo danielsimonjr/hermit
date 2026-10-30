@@ -24,7 +24,9 @@ deployment and whatever the agent wrote. Usage is read from the event stream, as
 
 `pi` is given the prompt in JSON mode, not print mode: it runs `pi --mode json --approve [--model M] [args] -- PROMPT`,
 so project `.pi/` resources are trusted for that process without writing `~/.pi/agent/trust.json`. Adapters that
-export roles still fail with the error from `hermit.hosts.pi.prepare`.
+export roles still fail with the error from `hermit.hosts.pi.prepare`. Pi's agent directory is private to the call
+(`<workspace>/.pi-agent`, or the `PI_CODING_AGENT_DIR` a sandbox or `params.env` gives): the user's
+`~/.pi/agent/auth.json` is copied into a directory made here for the run and deleted when the run ends.
 """
 from __future__ import annotations
 
@@ -146,8 +148,10 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
     prompt = _prompt(params, base, task)
     log, last = workspace / f"agent-{backend}.jsonl", workspace / ".last-message.txt"
     env = {**os.environ, **{k: os.path.expandvars(str(v)) for k, v in (params.get("env") or {}).items()}}
+    copied_auth = None
     if backend == "pi":
-        agent_dir = Path(env.get("PI_CODING_AGENT_DIR") or workspace / ".pi-agent")
+        given = env.get("PI_CODING_AGENT_DIR")
+        agent_dir = Path(given or workspace / ".pi-agent")
         agent_dir.mkdir(parents=True, exist_ok=True)
         env["PI_CODING_AGENT_DIR"] = str(agent_dir)
         provider = params.get("pi_provider")
@@ -155,17 +159,26 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
             document = {provider["name"]: {"baseUrl": provider["baseUrl"], "api": provider["api"],
                                             "apiKey": provider["apiKey"], "models": provider["models"]}}
             (agent_dir / "models.json").write_text(json.dumps({"providers": document}))
+        user_auth = Path.home() / ".pi/agent/auth.json"
+        if not given and user_auth.is_file():            # only a directory made here: a given one (a sandbox's, or
+            copied_auth = agent_dir / "auth.json"        # the user's own) already has its login, or is not ours to touch
+            shutil.copy2(user_auth, copied_auth)
+            os.chmod(copied_auth, 0o600)
     started = time.time()
-    with open(log, "w") as out:
-        try:
-            # An empty stdin: the CLI reads a non-terminal stdin to its end as more prompt, and an inherited one
-            # (a shell's socket, an open pipe) may never end.
-            proc = subprocess.run(command(backend, prompt, workspace, params, last), cwd=str(workspace), env=env,
-                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                  timeout=float(params.get("timeout_s", 3600)))
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            code = -1
+    try:
+        with open(log, "w") as out:
+            try:
+                # An empty stdin: the CLI reads a non-terminal stdin to its end as more prompt, and an inherited one
+                # (a shell's socket, an open pipe) may never end.
+                proc = subprocess.run(command(backend, prompt, workspace, params, last), cwd=str(workspace), env=env,
+                                      stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                      timeout=float(params.get("timeout_s", 3600)))
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                code = -1
+    finally:
+        if copied_auth is not None:
+            copied_auth.unlink(missing_ok=True)
     wall = round(time.time() - started, 1)
     _, usage = parse_log(log, backend, params.get("model") or backend)
     price_usage(usage, params)

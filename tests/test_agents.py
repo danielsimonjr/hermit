@@ -376,6 +376,69 @@ def test_pi_plain_model_writes_no_models_json(tmp_path, monkeypatch):
     assert "--provider" not in argv and argv[argv.index("--model") + 1] == "m1"
 
 
+PI_AUTH_MODE = FAKE_PI.replace("#!/bin/sh", '''#!/bin/sh
+printf %s "$(stat -c %a "$PI_CODING_AGENT_DIR/auth.json" 2>/dev/null || echo missing)" > .auth-mode
+cat "$PI_CODING_AGENT_DIR/auth.json" > .auth-seen 2>/dev/null''')
+
+
+def _planted_login(tmp_path, monkeypatch, body='{"token":"keep"}'):
+    home = _isolated_home(tmp_path, monkeypatch, "userhome")
+    login = home / ".pi" / "agent" / "auth.json"
+    login.parent.mkdir(parents=True)
+    login.write_text(body)
+    login.chmod(0o644)
+    return login
+
+
+def test_unsandboxed_pi_copies_auth_then_deletes_it(tmp_path, monkeypatch):
+    from test_backends import GLM, reg
+    from hermit.backends import bind_agent_params
+
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    login = _planted_login(tmp_path, monkeypatch)
+    _fake_pi_on_path(tmp_path, monkeypatch, PI_AUTH_MODE)
+    bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "hi", "workspaces": "ws", **bound})
+    ws = run({"id": "q7"}, None).log
+    assert (ws / ".auth-mode").read_text() == "600" and (ws / ".auth-seen").read_text() == '{"token":"keep"}'
+    assert (ws / ".pi-agent" / "models.json").is_file() and not (ws / ".pi-agent" / "auth.json").exists()
+    assert login.read_text() == '{"token":"keep"}' and oct(login.stat().st_mode & 0o777) == "0o644"
+    plain = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "hi", "workspaces": "ws"})
+    ws = plain({"id": "q8"}, None).log                         # a plain model id needs the login too
+    assert (ws / ".auth-seen").read_text() == '{"token":"keep"}'
+    assert not (ws / ".pi-agent" / "auth.json").exists() and not (ws / ".pi-agent" / "models.json").exists()
+    login.unlink()
+    ws = run({"id": "q9"}, None).log                           # no login to copy: not an error
+    assert (ws / ".auth-mode").read_text() == "missing"
+    assert (ws / ".pi-agent" / "models.json").is_file() and not (ws / ".pi-agent" / "auth.json").exists()
+
+
+def test_unsandboxed_pi_removes_the_login_copy_after_a_timeout(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    login = _planted_login(tmp_path, monkeypatch)
+    _fake_pi_on_path(tmp_path, monkeypatch, "#!/bin/sh\nsleep 2\n")
+    run = load_pipeline("hermit.agents.cli:run", tmp_path,
+                        {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
+    out = run({"id": "t1"}, None)
+    assert out.extra["timed_out"] is True
+    assert not (out.log / ".pi-agent" / "auth.json").exists() and login.is_file()
+
+
+def test_pi_leaves_a_given_agent_dirs_login_alone(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    login = _planted_login(tmp_path, monkeypatch, '{"token":"home"}')
+    given = tmp_path / "given-agent"
+    given.mkdir()
+    (given / "auth.json").write_text('{"token":"theirs"}')
+    _fake_pi_on_path(tmp_path, monkeypatch, PI_AUTH_MODE)
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, {
+        "backend": "pi", "prompt": "hi", "workspaces": "ws", "env": {"PI_CODING_AGENT_DIR": str(given)}})
+    ws = run({"id": "t1"}, None).log
+    assert (ws / ".auth-seen").read_text() == '{"token":"theirs"}'      # not overwritten with the home login
+    assert (given / "auth.json").read_text() == '{"token":"theirs"}'    # and not deleted after the call
+    assert login.read_text() == '{"token":"home"}' and not (ws / ".pi-agent").exists()
+
+
 def test_parse_log_pi_skips_a_truncated_line(tmp_path):
     from hermit.agents.cli import last_message
     from hermit.evolver.agent import parse_log
