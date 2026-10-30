@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import threading
@@ -111,9 +112,22 @@ echo '{"type":"system","session_id":"s1"}'
 echo '{"type":"result","result":"ANSWER 43","num_turns":3,"total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0}}'
 '''
 FAKE_PI = '''#!/bin/sh
-printf '%s\\n' "$*" > .args
+printf '%s\\n' "$@" > .args
 echo '{"type":"result","result":"ANSWER 44"}'
 '''
+
+
+def _isolated_home(tmp_path, monkeypatch, name="home"):
+    """A temporary HOME, so a test can see whether anything is written under `~/.pi`. The real user site stays
+    importable: the deployed adapter's MCP check runs a fresh interpreter."""
+    import site
+    user_site = site.getusersitepackages()
+    if user_site:
+        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    home = tmp_path / name
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 @pytest.mark.parametrize("backend,script,answer", [
@@ -138,20 +152,14 @@ def test_cli_agent_with_fake_cli(tmp_path, monkeypatch, backend, script, answer)
               "workspaces": "ws", "model": "m1"}
     adapter = EXAMPLE
     if backend == "pi":
-        import site
         from test_convert import variant
-        user_site = site.getusersitepackages()
-        if user_site:
-            monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
-        adapter = variant(tmp_path / "pi_adapter", roles=False)
-        home = tmp_path / "home"
-        home.mkdir()
-        monkeypatch.setenv("HOME", str(home))
+        adapter = variant(tmp_path / "pi_adapter", roles=False)      # Pi refuses the example's role
+        home = _isolated_home(tmp_path, monkeypatch)
     run = load_pipeline("hermit.agents.cli:run", tmp_path, params)
     out = run({"id": "q7", "question": "6*7"}, adapter)
 
     ws = out.log
-    assert ws.parent == tmp_path / "ws" and ws.name.startswith("q7-") and out.output == answer
+    assert ws.parent == tmp_path / "ws" and re.fullmatch(r"q7-[0-9a-f]{8}", ws.name) and out.output == answer
     if backend == "codex":
         context_file = ws / "AGENTS.md"
     elif backend == "pi":
@@ -170,10 +178,10 @@ def test_cli_agent_with_fake_cli(tmp_path, monkeypatch, backend, script, answer)
     elif backend == "claude-code":
         assert out.cost_usd == 0.5 and out.tokens == 15
     else:
-        assert "--mode" in args and "json" in args and "--approve" in args
-        assert "--print" not in args and "--api-key" not in args and "--provider" not in args
-        assert "m1" in args
+        assert args.splitlines() == ["--mode", "json", "--approve", "--model", "m1", "--",
+                                     "Solve 6*7 in this workspace."]
         assert not (home / ".pi").exists()
+        assert run({"id": "q7", "question": "6*7"}, adapter).log != ws
     assert out.extra["exit_code"] == 0 and out.extra["backend"] in ("codex", "claude", "pi")
     assert out.extra["timed_out"] is False
 
@@ -227,11 +235,8 @@ def test_pi_cli_refuses_roles(tmp_path, monkeypatch):
     adapter = subagent_adapter(tmp_path)
     with pytest.raises(ValueError, match="reviewer"):
         run({"id": "t1"}, adapter, params={"backend": "pi", "prompt": "x"}, base=tmp_path)
-    ws_root = tmp_path / ".logs" / "workspaces"
-    if ws_root.exists():
-        for ws in ws_root.iterdir():
-            assert not (ws / "AGENTS.md").exists()
-            assert not (ws / ".pi").exists()
+    [ws] = (tmp_path / ".logs" / "workspaces").iterdir()      # `_run` makes the workspace before it deploys
+    assert not (ws / "AGENTS.md").exists() and not (ws / ".pi").exists()
 
 
 def test_cli_rejects_an_unknown_backend(tmp_path):
@@ -242,4 +247,3 @@ def test_cli_rejects_an_unknown_backend(tmp_path):
     msg = str(exc.value)
     assert "codex" in msg and "pi" in msg
     assert not (tmp_path / ".logs").exists()
-
