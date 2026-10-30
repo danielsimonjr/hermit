@@ -1,0 +1,43 @@
+name: Pytest
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Verify user namespaces
+        run: bwrap --unshare-user --unshare-net --ro-bind / / true
+      # A venv, not the runner's Python: a sandbox binds the interpreter's whole prefix, and
+      # tests/test_sandbox.py::test_inside_the_sandbox needs pytest absent from it.
+      - name: Install package and test dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e '.[test]'
+      - name: Run tests
+        run: .venv/bin/python -m pytest tests
