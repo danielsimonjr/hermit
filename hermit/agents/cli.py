@@ -1,4 +1,4 @@
-"""The `codex`, `claude-code`, and `pi` agents: one task run by the agent CLI in a workspace the adapter is deployed into.
+"""The `codex`, `claude-code` and `pi` agents: one task run by the agent CLI in a workspace the adapter is deployed into.
 
     agent:
       name: codex                            # or claude-code or pi; `cli` with params.backend is the same
@@ -22,8 +22,11 @@ would (AGENTS.md or CLAUDE.md, the MCP server, skills, roles), the prompt is giv
 the agent's last message is the output. The workspace is the log: it keeps the agent's JSON event stream, the
 deployment and whatever the agent wrote. Usage is read from the event stream, as the AgentEvolver reads it.
 
-`pi` runs `pi --mode json --approve` so project `.pi/` resources are trusted for that process without writing
-`~/.pi/agent/trust.json`. Adapters that export roles still fail with the error from `hermit.hosts.pi.prepare`.
+`pi` is given the prompt in JSON mode, not print mode: it runs `pi --mode json --approve [--model M] [args] -- PROMPT`,
+so project `.pi/` resources are trusted for that process without writing `~/.pi/agent/trust.json`. Adapters that
+export roles still fail with the error from `hermit.hosts.pi.prepare`. Pi's agent directory is private to the call
+(`<workspace>/.pi-agent`, or the `PI_CODING_AGENT_DIR` a sandbox or `params.env` gives): the user's
+`~/.pi/agent/auth.json` is copied into a directory made here for the run and deleted when the run ends.
 """
 from __future__ import annotations
 
@@ -37,7 +40,6 @@ import time
 import uuid
 
 from hermit.agents.base import Agent
-from hermit.backends import PI_BUILTIN_PROVIDERS  # noqa: F401 — documented built-in Pi provider ids
 from hermit.evolver.agent import parse_log, price_usage
 from hermit.task import RunOutput
 
@@ -81,10 +83,9 @@ def command(backend: str, prompt: str, workspace: Path, params: dict, last_messa
                 *(["-m", model] if model else []), *args, prompt]
     if backend == "pi":
         provider = params.get("pi_provider")
-        if provider:
-            return ["pi", "--mode", "json", "--approve", "--provider", provider["name"], "--model", model,
-                    *args, prompt]
-        return ["pi", "--mode", "json", "--approve", *(["--model", model] if model else []), *args, prompt]
+        selected = ["--provider", provider["name"], "--model", model] if provider else (["--model", model] if model else [])
+        # `--` ends option parsing, so a prompt that begins with `-` is a prompt and not an unknown option.
+        return ["pi", "--mode", "json", "--approve", *selected, *args, "--", prompt]
     return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--permission-mode", params.get("claude_permission_mode", "bypassPermissions"),
             *(["--model", model] if model else []), *args]
@@ -100,13 +101,13 @@ def last_message(backend: str, log: Path, last: Path) -> str:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("type") != "message_end":
+            message = event.get("message") if isinstance(event, dict) and event.get("type") == "message_end" else None
+            if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
-            message = event.get("message") or {}
-            if message.get("role") != "assistant":
-                continue
-            blocks = [b.get("text", "") for b in message.get("content") or [] if b.get("type") == "text"]
-            text = "".join(blocks)
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else []
+            text = "".join(b["text"] for b in blocks
+                           if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
         return text
     text = ""
     for line in log.read_text(errors="replace").splitlines():
@@ -149,26 +150,20 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
     env = {**os.environ, **{k: os.path.expandvars(str(v)) for k, v in (params.get("env") or {}).items()}}
     copied_auth = None
     if backend == "pi":
-        sandbox_agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
-        agent_dir = env.get("PI_CODING_AGENT_DIR")
-        if not agent_dir:
-            agent_dir_path = workspace / ".pi-agent"
-            agent_dir_path.mkdir(parents=True, exist_ok=True)
-            agent_dir = str(agent_dir_path)
-        else:
-            agent_dir_path = Path(agent_dir)
-        env["PI_CODING_AGENT_DIR"] = agent_dir
+        given = env.get("PI_CODING_AGENT_DIR")
+        agent_dir = Path(given or workspace / ".pi-agent")
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        env["PI_CODING_AGENT_DIR"] = str(agent_dir)
         provider = params.get("pi_provider")
         if provider:
             document = {provider["name"]: {"baseUrl": provider["baseUrl"], "api": provider["api"],
                                             "apiKey": provider["apiKey"], "models": provider["models"]}}
-            (Path(agent_dir) / "models.json").write_text(json.dumps({"providers": document}))
-        if not sandbox_agent_dir:
-            user_auth = Path.home() / ".pi/agent/auth.json"
-            if user_auth.is_file():
-                copied_auth = Path(agent_dir) / "auth.json"
-                shutil.copy2(user_auth, copied_auth)
-                os.chmod(copied_auth, 0o600)
+            (agent_dir / "models.json").write_text(json.dumps({"providers": document}))
+        user_auth = Path.home() / ".pi/agent/auth.json"
+        if not given and user_auth.is_file():            # only a directory made here: a given one (a sandbox's, or
+            copied_auth = agent_dir / "auth.json"        # the user's own) already has its login, or is not ours to touch
+            shutil.copy2(user_auth, copied_auth)
+            os.chmod(copied_auth, 0o600)
     started = time.time()
     try:
         with open(log, "w") as out:

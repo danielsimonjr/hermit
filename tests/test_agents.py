@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import threading
@@ -111,13 +112,26 @@ echo '{"type":"system","session_id":"s1"}'
 echo '{"type":"result","result":"ANSWER 43","num_turns":3,"total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0}}'
 '''
 FAKE_PI = '''#!/bin/sh
-printf '%s\\n' "$*" > .args
+printf '%s\\n' "$@" > .args
 echo '{"type":"session","id":"ps1","cwd":"/tmp"}'
 echo '{"type":"message_update","usage":{"input":99999}}'
 echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"draft"},{"type":"thinking","thinking":"x"}],"usage":{"input":10,"output":4,"cacheRead":3,"cacheWrite":1,"reasoning":2,"cost":{"total":0.01}}}}'
 echo '{"type":"message_end","message":{"role":"toolResult","usage":{"input":100,"output":50,"cacheRead":0,"cost":{"total":9}}}}'
-echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],"usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.02}}}}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"ANSWER 44"}],"usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.02}}}}'
 '''
+
+
+def _isolated_home(tmp_path, monkeypatch, name="home"):
+    """A temporary HOME, so a test can see whether anything is written under `~/.pi`. The real user site stays
+    importable: the deployed adapter's MCP check runs a fresh interpreter."""
+    import site
+    user_site = site.getusersitepackages()
+    if user_site:
+        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    home = tmp_path / name
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 @pytest.mark.parametrize("backend,script,answer", [
@@ -142,20 +156,14 @@ def test_cli_agent_with_fake_cli(tmp_path, monkeypatch, backend, script, answer)
               "workspaces": "ws", "model": "m1"}
     adapter = EXAMPLE
     if backend == "pi":
-        import site
         from test_convert import variant
-        user_site = site.getusersitepackages()
-        if user_site:
-            monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
-        adapter = variant(tmp_path / "pi_adapter", roles=False)
-        home = tmp_path / "home"
-        home.mkdir()
-        monkeypatch.setenv("HOME", str(home))
+        adapter = variant(tmp_path / "pi_adapter", roles=False)      # Pi refuses the example's role
+        home = _isolated_home(tmp_path, monkeypatch)
     run = load_pipeline("hermit.agents.cli:run", tmp_path, params)
     out = run({"id": "q7", "question": "6*7"}, adapter)
 
     ws = out.log
-    assert ws.parent == tmp_path / "ws" and ws.name.startswith("q7-") and out.output == answer
+    assert ws.parent == tmp_path / "ws" and re.fullmatch(r"q7-[0-9a-f]{8}", ws.name) and out.output == answer
     if backend == "codex":
         context_file = ws / "AGENTS.md"
     elif backend == "pi":
@@ -174,10 +182,10 @@ def test_cli_agent_with_fake_cli(tmp_path, monkeypatch, backend, script, answer)
     elif backend == "claude-code":
         assert out.cost_usd == 0.5 and out.tokens == 15
     else:
-        assert "--mode" in args and "json" in args and "--approve" in args
-        assert "--print" not in args and "--api-key" not in args and "--provider" not in args
-        assert "m1" in args
+        assert args.splitlines() == ["--mode", "json", "--approve", "--model", "m1", "--",
+                                     "Solve 6*7 in this workspace."]
         assert not (home / ".pi").exists()
+        assert run({"id": "q7", "question": "6*7"}, adapter).log != ws
     assert out.extra["exit_code"] == 0 and out.extra["backend"] in ("codex", "claude", "pi")
     assert out.extra["timed_out"] is False
 
@@ -231,11 +239,8 @@ def test_pi_cli_refuses_roles(tmp_path, monkeypatch):
     adapter = subagent_adapter(tmp_path)
     with pytest.raises(ValueError, match="reviewer"):
         run({"id": "t1"}, adapter, params={"backend": "pi", "prompt": "x"}, base=tmp_path)
-    ws_root = tmp_path / ".logs" / "workspaces"
-    if ws_root.exists():
-        for ws in ws_root.iterdir():
-            assert not (ws / "AGENTS.md").exists()
-            assert not (ws / ".pi").exists()
+    [ws] = (tmp_path / ".logs" / "workspaces").iterdir()      # `_run` makes the workspace before it deploys
+    assert not (ws / "AGENTS.md").exists() and not (ws / ".pi").exists()
 
 
 def test_cli_rejects_an_unknown_backend(tmp_path):
@@ -248,33 +253,26 @@ def test_cli_rejects_an_unknown_backend(tmp_path):
     assert not (tmp_path / ".logs").exists()
 
 
-def _pi_run(tmp_path, monkeypatch, params=None):
-    import site
-    from test_convert import variant
-
+def _fake_pi_on_path(tmp_path, monkeypatch, script=FAKE_PI):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     exe = bin_dir / "pi"
-    exe.write_text(FAKE_PI)
+    exe.write_text(script)
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    user_site = site.getusersitepackages()
-    if user_site:
-        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    adapter_root = tmp_path / "pi_adapter"
-    adapter_dir = adapter_root / "adapter"
-    if not adapter_dir.is_dir():
-        adapter = variant(adapter_root, roles=False)
-    else:
-        adapter = adapter_dir
-    home = tmp_path / "home"
-    home.mkdir(exist_ok=True)
-    monkeypatch.setenv("HOME", str(home))
+
+
+def _pi_run(tmp_path, monkeypatch, params=None):
+    from test_convert import variant
+
+    _fake_pi_on_path(tmp_path, monkeypatch)
+    _isolated_home(tmp_path, monkeypatch)
+    adapter = tmp_path / "pi_adapter" / "adapter"
+    if not adapter.is_dir():
+        variant(tmp_path / "pi_adapter", roles=False)
     (tmp_path / "prompt.md").write_text("Solve {question}.")
-    base_params = {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", "model": "m1"}
-    if params:
-        base_params.update(params)
-    run = load_pipeline("hermit.agents.cli:run", tmp_path, base_params)
+    run = load_pipeline("hermit.agents.cli:run", tmp_path,
+                        {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", "model": "m1", **(params or {})})
     return run({"id": "q7", "question": "6*7"}, adapter)
 
 
@@ -307,109 +305,138 @@ def test_parse_log_pi_ignores_snapshots_reasoning_and_tool_usage(tmp_path):
     u = usage[0]
     assert u.calls == 2 and u.output_tokens == 9
     assert u.input_tokens == 33 and u.cached_input_tokens == 3
+    assert u.cost_usd == pytest.approx(0.03)                  # the tool result's 9 is nested work, not this call
+    assert not [name for name in vars(u) if "write" in name]  # Usage has nowhere to put cacheWrite
 
 
-def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch):
-    slow = FAKE_PI.replace("#!/bin/sh", "#!/bin/sh\nsleep 2")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    exe = bin_dir / "pi"
-    exe.write_text(slow)
-    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+@pytest.mark.parametrize("script", [FAKE_PI.replace("#!/bin/sh", "#!/bin/sh\nsleep 2"),
+                                    "#!/bin/sh\nprintf '{\"type\":'\nsleep 2\n"], ids=["empty-log", "truncated-line"])
+def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch, script):
+    _fake_pi_on_path(tmp_path, monkeypatch, script)
     run = load_pipeline("hermit.agents.cli:run", tmp_path,
-                         {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
+                        {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
     out = run({"id": "t1"}, None)
     assert out.extra["exit_code"] == -1 and out.extra["timed_out"] is True
+    assert out.output == "" and out.tokens is None and out.cost_usd is None
 
 
 def test_pi_models_json_uses_a_private_agent_dir(tmp_path, monkeypatch):
-    import site
     from test_backends import GLM, reg
     from test_convert import variant
     from hermit.backends import bind_agent_params
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "sekret")
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
-    script = FAKE_PI.replace("#!/bin/sh", '#!/bin/sh\necho "$PI_CODING_AGENT_DIR" > .pi-dir')
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    (bin_dir / "pi").write_text(script)
-    (bin_dir / "pi").chmod(stat.S_IEXEC | stat.S_IRUSR | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    user_site = site.getusersitepackages()
-    if user_site:
-        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    adapter_root = tmp_path / "pi_adapter"
-    adapter = variant(adapter_root, roles=False)
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _fake_pi_on_path(tmp_path, monkeypatch, FAKE_PI.replace("#!/bin/sh", '#!/bin/sh\nprintf %s "$PI_CODING_AGENT_DIR" > .pi-dir'))
+    home = _isolated_home(tmp_path, monkeypatch)
+    adapter = variant(tmp_path / "pi_adapter", roles=False)
     (tmp_path / "prompt.md").write_text("Solve {question}.")
     run = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws",
                                                              **bound})
-    out = run({"id": "q7", "question": "6*7"}, adapter)
-    ws = out.log
-    agent_dir = ws / ".pi-agent"
-    models = json.loads((agent_dir / "models.json").read_text())
-    assert agent_dir.is_dir() and not (home / ".pi").exists()
-    prov = bound["pi_provider"]
-    assert models["providers"][prov["name"]]["apiKey"] == "$FIREWORKS_API_KEY"
-    args = (ws / ".args").read_text()
-    assert "--provider" in args and prov["name"] in args and "--model" in args and GLM in args
-    assert "--api-key" not in args and "sekret" not in args
-    first_dir = agent_dir.resolve()
-    out2 = run({"id": "q8", "question": "6*7"}, adapter)
-    second_dir = (out2.log / ".pi-agent").resolve()
-    assert second_dir != first_dir
-    assert not first_dir.joinpath("models.json").samefile(second_dir / "models.json")
+    first = run({"id": "q7", "question": "6*7"}, adapter).log
+    agent_dir = first / ".pi-agent"
+    assert (first / ".pi-dir").read_text() == str(agent_dir) and not (home / ".pi").exists()
+    name = bound["pi_provider"]["name"]
+    assert name == "hermit-fireworks"
+    document = (agent_dir / "models.json").read_text()
+    assert json.loads(document) == {"providers": {name: {
+        "baseUrl": "https://api.fireworks.ai/inference/v1", "api": "openai-completions",
+        "apiKey": "$FIREWORKS_API_KEY", "models": [{"id": GLM}]}}}
+    assert "sekret" not in document
+    argv = (first / ".args").read_text().splitlines()
+    assert ["--provider", name, "--model", GLM] == argv[argv.index("--provider"):][:4]
+    assert "--api-key" not in argv and "sekret" not in "".join(argv)
+    second = run({"id": "q8", "question": "6*7"}, adapter).log
+    assert (second / ".pi-agent") != agent_dir and (second / ".pi-agent" / "models.json").is_file()
+    assert (agent_dir / "models.json").read_text() == document
+
+
+def test_pi_uses_the_agent_dir_it_is_given(tmp_path, monkeypatch):
+    from test_backends import GLM, reg
+    from hermit.backends import bind_agent_params
+
+    bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
+    _fake_pi_on_path(tmp_path, monkeypatch, FAKE_PI.replace("#!/bin/sh", '#!/bin/sh\nprintf %s "$PI_CODING_AGENT_DIR" > .pi-dir'))
+    home = _isolated_home(tmp_path, monkeypatch)
+    given = tmp_path / "elsewhere" / "agent"                  # not created yet
+    out = load_pipeline("hermit.agents.cli:run", tmp_path, {
+        "backend": "pi", "prompt": "hi", "workspaces": "ws", "env": {"PI_CODING_AGENT_DIR": str(given)},
+        **bound})({"id": "t1"}, None)
+    assert (out.log / ".pi-dir").read_text() == str(given)
+    assert (given / "models.json").is_file()
+    assert not (out.log / ".pi-agent").exists() and not (home / ".pi").exists()
+
+
+def test_pi_plain_model_writes_no_models_json(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    out = _pi_run(tmp_path, monkeypatch)
+    assert (out.log / ".pi-agent").is_dir() and not (out.log / ".pi-agent" / "models.json").exists()
+    argv = (out.log / ".args").read_text().splitlines()
+    assert "--provider" not in argv and argv[argv.index("--model") + 1] == "m1"
+
+
+PI_AUTH_MODE = FAKE_PI.replace("#!/bin/sh", '''#!/bin/sh
+printf %s "$(stat -c %a "$PI_CODING_AGENT_DIR/auth.json" 2>/dev/null || echo missing)" > .auth-mode
+cat "$PI_CODING_AGENT_DIR/auth.json" > .auth-seen 2>/dev/null''')
+
+
+def _planted_login(tmp_path, monkeypatch, body='{"token":"keep"}'):
+    home = _isolated_home(tmp_path, monkeypatch, "userhome")
+    login = home / ".pi" / "agent" / "auth.json"
+    login.parent.mkdir(parents=True)
+    login.write_text(body)
+    login.chmod(0o644)
+    return login
 
 
 def test_unsandboxed_pi_copies_auth_then_deletes_it(tmp_path, monkeypatch):
-    import site
     from test_backends import GLM, reg
-    from test_convert import variant
     from hermit.backends import bind_agent_params
 
-    user_home = tmp_path / "userhome"
-    user_home.mkdir()
-    login = user_home / ".pi" / "agent" / "auth.json"
-    login.parent.mkdir(parents=True)
-    login.write_text('{"token":"keep"}')
-    monkeypatch.setenv("HOME", str(user_home))
-    user_site = site.getusersitepackages()
-    if user_site:
-        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    login = _planted_login(tmp_path, monkeypatch)
+    _fake_pi_on_path(tmp_path, monkeypatch, PI_AUTH_MODE)
     bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
-    monkeypatch.setenv("FIREWORKS_API_KEY", "k")
-    script = FAKE_PI.replace(
-        "#!/bin/sh",
-        '#!/bin/sh\n'
-        'mode=$(stat -c \'%a\' "$PI_CODING_AGENT_DIR/auth.json" 2>/dev/null || echo missing)\n'
-        'echo "$mode" > .auth-mode\n',
-    )
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    (bin_dir / "pi").write_text(script)
-    (bin_dir / "pi").chmod(stat.S_IEXEC | stat.S_IRUSR | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    adapter = variant(tmp_path / "pi_adapter2", roles=False)
-    (tmp_path / "prompt.md").write_text("Solve {question}.")
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "hi", "workspaces": "ws", **bound})
+    ws = run({"id": "q7"}, None).log
+    assert (ws / ".auth-mode").read_text() == "600" and (ws / ".auth-seen").read_text() == '{"token":"keep"}'
+    assert (ws / ".pi-agent" / "models.json").is_file() and not (ws / ".pi-agent" / "auth.json").exists()
+    assert login.read_text() == '{"token":"keep"}' and oct(login.stat().st_mode & 0o777) == "0o644"
+    plain = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "hi", "workspaces": "ws"})
+    ws = plain({"id": "q8"}, None).log                         # a plain model id needs the login too
+    assert (ws / ".auth-seen").read_text() == '{"token":"keep"}'
+    assert not (ws / ".pi-agent" / "auth.json").exists() and not (ws / ".pi-agent" / "models.json").exists()
+    login.unlink()
+    ws = run({"id": "q9"}, None).log                           # no login to copy: not an error
+    assert (ws / ".auth-mode").read_text() == "missing"
+    assert (ws / ".pi-agent" / "models.json").is_file() and not (ws / ".pi-agent" / "auth.json").exists()
+
+
+def test_unsandboxed_pi_removes_the_login_copy_after_a_timeout(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    login = _planted_login(tmp_path, monkeypatch)
+    _fake_pi_on_path(tmp_path, monkeypatch, "#!/bin/sh\nsleep 2\n")
     run = load_pipeline("hermit.agents.cli:run", tmp_path,
-                         {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", **bound})
-    out = run({"id": "q7", "question": "6*7"}, adapter)
-    ws = out.log
-    agent_dir = ws / ".pi-agent"
-    assert (agent_dir / "models.json").is_file()
-    assert not (agent_dir / "auth.json").exists()
-    assert login.read_text() == '{"token":"keep"}'
-    assert (ws / ".auth-mode").read_text().strip() == "600"
-    user_home2 = tmp_path / "userhome2"
-    user_home2.mkdir()
-    monkeypatch.setenv("HOME", str(user_home2))
-    out2 = run({"id": "q8", "question": "6*7"}, adapter)
-    assert (out2.log / ".pi-agent" / "models.json").is_file()
-    assert not (out2.log / ".pi-agent" / "auth.json").exists()
+                        {"backend": "pi", "prompt": "hi", "timeout_s": 0.2, "workspaces": "ws"})
+    out = run({"id": "t1"}, None)
+    assert out.extra["timed_out"] is True
+    assert not (out.log / ".pi-agent" / "auth.json").exists() and login.is_file()
+
+
+def test_pi_leaves_a_given_agent_dirs_login_alone(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    login = _planted_login(tmp_path, monkeypatch, '{"token":"home"}')
+    given = tmp_path / "given-agent"
+    given.mkdir()
+    (given / "auth.json").write_text('{"token":"theirs"}')
+    _fake_pi_on_path(tmp_path, monkeypatch, PI_AUTH_MODE)
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, {
+        "backend": "pi", "prompt": "hi", "workspaces": "ws", "env": {"PI_CODING_AGENT_DIR": str(given)}})
+    ws = run({"id": "t1"}, None).log
+    assert (ws / ".auth-seen").read_text() == '{"token":"theirs"}'      # not overwritten with the home login
+    assert (given / "auth.json").read_text() == '{"token":"theirs"}'    # and not deleted after the call
+    assert login.read_text() == '{"token":"home"}' and not (ws / ".pi-agent").exists()
 
 
 def test_parse_log_pi_skips_a_truncated_line(tmp_path):
@@ -420,12 +447,28 @@ def test_parse_log_pi_skips_a_truncated_line(tmp_path):
     log.write_text(
         '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ANSWER 44"}],'
         '"usage":{"input":20,"output":5,"cacheRead":0,"cost":{"total":0.02}}}}\n'
+        "42\n"                     # JSON, but no record: stderr shares this file
         "{\n"
     )
     _, usage = parse_log(log, "pi", "m")
     assert usage[0].output_tokens == 5
+    assert last_message("pi", log, tmp_path / ".last") == "ANSWER 44"
     empty = tmp_path / "empty.jsonl"
     empty.write_text("")
     assert parse_log(empty, "pi", "m") == (None, [])
     assert last_message("pi", empty, tmp_path / ".last") == ""
 
+
+def test_last_message_pi_is_the_text_of_the_last_assistant_message(tmp_path):
+    from hermit.agents.cli import last_message
+
+    log = tmp_path / "agent-pi.jsonl"
+    text = '{"type":"message_end","message":{"role":"assistant","content":[%s]}}\n'
+    log.write_text(text % '{"type":"text","text":"a"},{"type":"thinking","thinking":"x"},{"type":"text","text":"b"}')
+    assert last_message("pi", log, tmp_path / ".last") == "ab"              # joined with no separator
+    with log.open("a") as out:
+        out.write('{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"tool"}]}}\n')
+    assert last_message("pi", log, tmp_path / ".last") == "ab"              # a tool result is not the answer
+    with log.open("a") as out:
+        out.write(text % '{"type":"toolCall","id":"c1","name":"bash","arguments":{}}')
+    assert last_message("pi", log, tmp_path / ".last") == ""                # the last message has no text block

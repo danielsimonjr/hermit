@@ -648,47 +648,46 @@ def test_cli_homes_keeps_codex_and_claude_and_adds_pi():
 
 @needs_bwrap
 def test_sandboxed_pi_mounts_the_binary_and_drops_the_login(tmp_path, monkeypatch):
-    import site
+    from test_agents import _isolated_home
     from test_backends import GLM, reg
     from test_convert import variant
     from hermit.backends import bind_agent_params
 
+    # Everything but the project sits outside it, so that what the call can read is what the sandbox granted.
     install = tmp_path / "opt" / "pi"
     (install / "bin").mkdir(parents=True)
     (install / "marker.txt").write_text("MARKER")
+    (install.parent / "sibling.txt").write_text("outside the install prefix")
     pi_bin = install / "bin" / "pi"
-    helper = Path(__file__).resolve().parent / "pi_sandbox_fake.py"
-    pi_bin.write_text(f"#!/bin/sh\nexec {sys.executable} {helper} {install}\n")
-    pi_bin.chmod(0o755)
-    user_home = tmp_path / "userhome"
-    user_home.mkdir()
+    user_home = _isolated_home(tmp_path, monkeypatch, "userhome")
     (user_home / "secret.txt").write_text("outside")
-    agent_login = user_home / ".pi" / "agent" / "auth.json"
-    agent_login.parent.mkdir(parents=True)
-    agent_login.write_text('{"token":"fixture"}')
-    monkeypatch.setenv("HOME", str(user_home))
+    login = user_home / ".pi" / "agent" / "auth.json"
+    login.parent.mkdir(parents=True)
+    login.write_text("fixture-login")
+    pi_bin.write_text(f"""#!/bin/sh
+readable() {{ [ -r "$1" ] && echo READ || echo NO; }}
+text="$(cat {install}/marker.txt)|$(readable {install.parent}/sibling.txt)|$(readable {user_home}/secret.txt)"
+text="$text|$(cat "$PI_CODING_AGENT_DIR/auth.json" 2>/dev/null || echo none)|$PI_CODING_AGENT_DIR"
+printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"%s"}}]}}}}\\n' "$text"
+""")
+    pi_bin.chmod(0o755)
     monkeypatch.setenv("PATH", f"{install / 'bin'}{os.pathsep}{os.environ['PATH']}")
-    user_site = site.getusersitepackages()
-    if user_site:
-        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
     monkeypatch.setenv("FIREWORKS_API_KEY", "k")
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}", "prompt": "x"}, "pi", reg())
-    path = make_task(tmp_path, agent={"name": "pi", "params": bound, "concurrency": 1},
-                     sandbox={"enabled": True, "network": "isolated", "enforce": "required"})
-    cfg = Config.load(path, [])
-    adapter = variant(tmp_path / "ad", roles=False)
+    task = tmp_path / "task"
+    task.mkdir()
+    cfg = Config.load(make_task(task, agent={"name": "pi", "params": bound, "concurrency": 1},
+                                sandbox={"enabled": True, "network": "isolated", "enforce": "required"}), [])
     box = SandboxedAgent(cfg, "rollout", records=None)
     try:
-        out = box({"id": "t1", "a": 1, "b": 2}, adapter)
+        out = box({"id": "t1", "a": 1, "b": 2}, variant(tmp_path / "ad", roles=False))
     finally:
         box.close()
-    assert "MARKER|NO|" in out.output and "fixture" in out.output
-    assert ".pi/agent" in out.output
-    work_dirs = list((Path(cfg.base) / ".logs" / "rollout").glob("t1-*"))
-    assert work_dirs
-    call_home = work_dirs[0] / "home" / ".pi" / "agent"
-    assert (call_home / "models.json").is_file()
-    assert not (call_home / "auth.json").exists()
-    assert agent_login.read_text() == '{"token":"fixture"}'
-    assert not (out.log / ".pi-agent").exists()
-
+    [work] = box.work_root.glob("t1-*")
+    agent_dir = work / "home" / ".pi" / "agent"
+    assert out.output == f"MARKER|NO|NO|fixture-login|{agent_dir}"     # the binary runs; only its prefix is bound
+    assert (agent_dir / "models.json").is_file() and not (agent_dir / "auth.json").exists()
+    assert sorted(path.name for path in login.parent.iterdir()) == ["auth.json"]   # the user's directory is untouched
+    assert login.read_text() == "fixture-login"
+    assert not list(work.glob("**/.pi-agent"))

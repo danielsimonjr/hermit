@@ -204,6 +204,9 @@ def test_bind_pi_provider_document(monkeypatch):
     assert prov["name"] == "vllm" and prov["baseUrl"] == "http://127.0.0.1:8000/v1"
     assert prov["api"] == "openai-completions" and prov["apiKey"] == backends.PLACEHOLDER_KEY
     assert "sekret" not in json.dumps(out)
+    monkeypatch.setenv("VLLM_API_KEY", "sekret")
+    out = bind_agent_params({"backend": "pi", "model": f"vllm/{qwen}"}, "pi", r)
+    assert out["pi_provider"]["apiKey"] == "$VLLM_API_KEY" and "sekret" not in json.dumps(out)
     monkeypatch.setenv("FIREWORKS_API_KEY", "sekret")
     out = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}", "price": {"output": 0.5}}, "pi", reg())
     prov = out["pi_provider"]
@@ -223,6 +226,25 @@ def test_bind_pi_provider_document(monkeypatch):
     assert bind_agent_params(plain, "pi", r) is plain
     with pytest.raises(ValueError, match="kind must be codex, claude, or pi"):
         bind_agent_params({"model": "vllm/q"}, "hermes", r)
+
+
+def test_pi_provider_name_avoids_every_builtin_pi_provider():
+    from hermit.backends import PI_BUILTIN_PROVIDERS, pi_provider_name
+
+    assert len(PI_BUILTIN_PROVIDERS) == 43                     # builtinProviders() at the pin, plus llama.cpp
+    assert {"anthropic", "openai", "deepseek", "fireworks", "llama.cpp", "radius", "zai-coding-cn"} <= PI_BUILTIN_PROVIDERS
+    assert {"vllm", "sglang", "ollama"}.isdisjoint(PI_BUILTIN_PROVIDERS)
+    assert pi_provider_name("openrouter") == "hermit-openrouter" and pi_provider_name("llama.cpp") == "hermit-llama.cpp"
+    assert pi_provider_name("vllm") == "vllm"
+    custom = reg({"together": {"base_url": "http://127.0.0.1:9/v1", "key_required": False}})
+    out = bind_agent_params({"backend": "pi", "model": "together/m"}, "pi", custom)
+    assert out["pi_provider"]["name"] == "hermit-together"
+
+
+def test_a_spec_with_no_apis_stays_empty():
+    spec = Binding.from_spec({"base_url": "http://x/v1", "model": "m", "apis": []})
+    assert spec.backend.apis == () and Binding.from_spec(spec.spec()).backend.apis == ()
+    assert Binding.from_spec({"base_url": "http://x/v1", "model": "m"}).backend.apis == ("chat",)
 
 
 def test_normalize_config_binds_a_pi_agent(monkeypatch, tmp_path):

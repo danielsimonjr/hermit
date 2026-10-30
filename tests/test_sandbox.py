@@ -343,4 +343,3 @@ def test_pi_coding_agent_dir_survives_an_env_allow_list():
     args, env = Sandbox(enabled=False, env_allow=["LANG"]).wrap(
         ["true"], env={"LANG": "C", "PI_CODING_AGENT_DIR": "/tmp/agent", "NOT_A_SECRET": "x"})
     assert env["PI_CODING_AGENT_DIR"] == "/tmp/agent" and "NOT_A_SECRET" not in env
-

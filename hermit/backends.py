@@ -67,7 +67,17 @@ LITELLM_KEY_ENV = {"fireworks_ai": "FIREWORKS_AI_API_KEY", "openai": "OPENAI_API
                    "deepseek": "DEEPSEEK_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "ollama": "OLLAMA_API_KEY"}
 PLACEHOLDER_KEY = "local"      # sent to a server that needs no key, for clients that refuse to send none
 
-PI_BUILTIN_PROVIDERS = frozenset({"anthropic", "openai", "deepseek", "fireworks", "llama.cpp"})
+# Pi's own provider ids (`builtinProviders()` in packages/ai/src/providers/all.ts at the pinned fork commit, plus
+# the llama.cpp extension's LLAMA_PROVIDER_ID). A models.json entry under one of these names would replace Pi's
+# built-in provider, so a hermit backend that shares a name is written as `hermit-<name>`.
+PI_BUILTIN_PROVIDERS = frozenset({
+    "amazon-bedrock", "ant-ling", "anthropic", "azure", "baseten", "cerebras", "cloudflare-ai-gateway",
+    "cloudflare-workers-ai", "deepseek", "fireworks", "github-copilot", "google", "google-vertex", "groq",
+    "huggingface", "kimi-coding", "llama.cpp", "meta", "minimax", "minimax-cn", "mistral", "moonshotai",
+    "moonshotai-cn", "nvidia", "openai", "openai-codex", "opencode", "opencode-go", "openrouter",
+    "qwen-token-plan", "qwen-token-plan-cn", "qwen-token-plan-individual", "radius", "together", "typesafe",
+    "vercel-ai-gateway", "xai", "xiaomi", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn",
+    "xiaomi-token-plan-sgp", "zai", "zai-coding-cn"})
 
 
 def pi_provider_name(backend_name: str) -> str:
@@ -272,7 +282,7 @@ class Binding:
         name = spec.get("backend") or (urlsplit(spec["base_url"]).hostname or "custom")
         backend = Backend(name=name, base_url=str(spec["base_url"]).rstrip("/"), api_key_env=spec.get("api_key_env"),
                           key_required=bool(spec.get("key_required", True)),
-                          apis=tuple(spec["apis"] if "apis" in spec else (spec.get("apis") or ["chat"])), messages_url=spec.get("messages_url"),
+                          apis=tuple(["chat"] if spec.get("apis") is None else spec["apis"]), messages_url=spec.get("messages_url"),
                           litellm=(spec["litellm"].split("/", 1)[0] if spec.get("litellm") else None),
                           context_window=spec.get("context_window"))
         return cls(backend, str(spec["model"]), price=spec.get("price"), extra_body=dict(spec.get("extra_body") or {}))
