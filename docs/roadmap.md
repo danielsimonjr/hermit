@@ -195,7 +195,7 @@ The learner is still Codex or Claude Code. `evolver.name` does not gain `pi`. Sa
 - `docs/reference/config-fields.md`. Add `pi` to the `agent.name` cell and to the paragraph that describes how a reference becomes CLI provider settings. Pi's settings go into a per-call `models.json`, not into `args` or `env` alone.
 - `docs/framework/commands.md`. The deploy and convert sections already describe Pi. Add one sentence under deploy: a training run with `agent.name: pi` deploys each task workspace the same way and then runs `pi --mode json --approve` there.
 
-**Tests.** No new Python tests. The local docs build is the gate (Actions are not enabled on this fork). `.github/workflows/pages.yml` is the only workflow file; its `build` job runs `bash docs/build-pages.sh` and `python docs/check-pages.py`. `bash docs/build.sh` is the Sphinx-only html build.
+**Tests.** No new Python tests. The documentation build is the gate. `.github/workflows/docs-ci.yml` runs on every pull request and on every push to `main`; its `docs-build` job runs `bash docs/build-pages.sh` and `python docs/check-pages.py`. `.github/workflows/pages.yml` runs the same two commands in its `build` job before it uploads the site. `bash docs/build.sh` is the Sphinx-only html build.
 
 **Acceptance.**
 
