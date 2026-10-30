@@ -38,7 +38,6 @@ import time
 import uuid
 
 from hermit.agents.base import Agent
-from hermit.backends import PI_BUILTIN_PROVIDERS  # noqa: F401 — documented built-in Pi provider ids
 from hermit.evolver.agent import parse_log, price_usage
 from hermit.task import RunOutput
 
@@ -148,19 +147,14 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
     log, last = workspace / f"agent-{backend}.jsonl", workspace / ".last-message.txt"
     env = {**os.environ, **{k: os.path.expandvars(str(v)) for k, v in (params.get("env") or {}).items()}}
     if backend == "pi":
-        agent_dir = env.get("PI_CODING_AGENT_DIR")
-        if not agent_dir:
-            agent_dir_path = workspace / ".pi-agent"
-            agent_dir_path.mkdir(parents=True, exist_ok=True)
-            agent_dir = str(agent_dir_path)
-        else:
-            agent_dir_path = Path(agent_dir)
-        env["PI_CODING_AGENT_DIR"] = agent_dir
+        agent_dir = Path(env.get("PI_CODING_AGENT_DIR") or workspace / ".pi-agent")
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        env["PI_CODING_AGENT_DIR"] = str(agent_dir)
         provider = params.get("pi_provider")
         if provider:
             document = {provider["name"]: {"baseUrl": provider["baseUrl"], "api": provider["api"],
                                             "apiKey": provider["apiKey"], "models": provider["models"]}}
-            (Path(agent_dir) / "models.json").write_text(json.dumps({"providers": document}))
+            (agent_dir / "models.json").write_text(json.dumps({"providers": document}))
     started = time.time()
     with open(log, "w") as out:
         try:
