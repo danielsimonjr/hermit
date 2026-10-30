@@ -110,34 +110,72 @@ printf '%s\\n' "$*" > .args
 echo '{"type":"system","session_id":"s1"}'
 echo '{"type":"result","result":"ANSWER 43","num_turns":3,"total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0}}'
 '''
+FAKE_PI = '''#!/bin/sh
+printf '%s\\n' "$*" > .args
+echo '{"type":"result","result":"ANSWER 44"}'
+'''
 
 
-@pytest.mark.parametrize("backend,script,answer", [("codex", FAKE_CODEX, "ANSWER 42"), ("claude-code", FAKE_CLAUDE, "ANSWER 43")])
+@pytest.mark.parametrize("backend,script,answer", [
+    ("codex", FAKE_CODEX, "ANSWER 42"),
+    ("claude-code", FAKE_CLAUDE, "ANSWER 43"),
+    ("pi", FAKE_PI, "ANSWER 44"),
+])
 def test_cli_agent_with_fake_cli(tmp_path, monkeypatch, backend, script, answer):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    exe = bin_dir / ("codex" if backend == "codex" else "claude")
+    if backend == "codex":
+        exe = bin_dir / "codex"
+    elif backend == "pi":
+        exe = bin_dir / "pi"
+    else:
+        exe = bin_dir / "claude"
     exe.write_text(script)
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     (tmp_path / "prompt.md").write_text("Solve {question} in this workspace.")
     params = {"backend": backend, "prompt": "prompt.md", "price": {"input": 1, "cached_input": 0.5, "output": 2},
               "workspaces": "ws", "model": "m1"}
+    adapter = EXAMPLE
+    if backend == "pi":
+        import site
+        from test_convert import variant
+        user_site = site.getusersitepackages()
+        if user_site:
+            monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        adapter = variant(tmp_path / "pi_adapter", roles=False)
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
     run = load_pipeline("hermit.agents.cli:run", tmp_path, params)
-    out = run({"id": "q7", "question": "6*7"}, EXAMPLE)
+    out = run({"id": "q7", "question": "6*7"}, adapter)
 
     ws = out.log
     assert ws.parent == tmp_path / "ws" and ws.name.startswith("q7-") and out.output == answer
-    context_file = ws / ("AGENTS.md" if backend == "codex" else "CLAUDE.md")
+    if backend == "codex":
+        context_file = ws / "AGENTS.md"
+    elif backend == "pi":
+        context_file = ws / "AGENTS.md"
+    else:
+        context_file = ws / "CLAUDE.md"
     assert "hermit:file-example:start" in context_file.read_text()     # the adapter was deployed
     args = (ws / ".args").read_text()
-    assert "Solve 6*7 in this workspace." in args and "m1" in args
-    assert (ws / f"agent-{'codex' if backend == 'codex' else 'claude'}.jsonl").is_file()
+    assert "Solve 6*7 in this workspace." in args
+    if backend != "pi":
+        assert "m1" in args
+    log_name = {"codex": "codex", "claude-code": "claude", "pi": "pi"}[backend]
+    assert (ws / f"agent-{log_name}.jsonl").is_file()
     if backend == "codex":
         assert out.tokens == 1050 and out.cost_usd == pytest.approx((800 * 1 + 200 * 0.5 + 50 * 2) / 1e6)
-    else:
+    elif backend == "claude-code":
         assert out.cost_usd == 0.5 and out.tokens == 15
-    assert out.extra["exit_code"] == 0 and out.extra["backend"] in ("codex", "claude")
+    else:
+        assert "--mode" in args and "json" in args and "--approve" in args
+        assert "--print" not in args and "--api-key" not in args and "--provider" not in args
+        assert "m1" in args
+        assert not (home / ".pi").exists()
+    assert out.extra["exit_code"] == 0 and out.extra["backend"] in ("codex", "claude", "pi")
+    assert out.extra["timed_out"] is False
 
 
 def test_load_pipeline_binds_only_what_is_asked(tmp_path):
@@ -158,6 +196,10 @@ def test_load_agent_builtin_class_function_and_alias(tmp_path):
     assert isinstance(load_agent("react", {"model": {}}, tmp_path), ReactAgent)
     claude = load_agent("claude-code", {"model": "m"}, tmp_path)
     assert isinstance(claude, CliAgent) and claude.params["backend"] == "claude" and claude.base == tmp_path.resolve()
+    pi = load_agent("pi", {"model": "m"}, tmp_path)
+    assert isinstance(pi, CliAgent) and pi.params["backend"] == "pi"
+    cli_pi = load_agent("cli", {"backend": "pi"}, tmp_path)
+    assert isinstance(cli_pi, CliAgent) and cli_pi.params["backend"] == "pi"
     (tmp_path / "agent.py").write_text(
         "from hermit.agents import Agent\nfrom hermit.task import RunOutput\n"
         "class Mine(Agent):\n    def run(self, task, adapter):\n        return RunOutput(output=(self.params['k'], str(self.base.name), adapter))\n"
@@ -176,3 +218,28 @@ def test_load_agent_builtin_class_function_and_alias(tmp_path):
         "judge: {path: judge.py}\ntemplate: prompt-only@1.0\nevolver: {name: gepa}\n")
     cfg = Config.load(tmp_path / "run.yaml", [])
     assert cfg["agent"] == {"name": "agent.py:plain", "concurrency": 2, "timeout_min": None, "params": {"x": 1}}
+
+
+def test_pi_cli_refuses_roles(tmp_path, monkeypatch):
+    from test_deploy import subagent_adapter
+    from hermit.agents.cli import run
+
+    adapter = subagent_adapter(tmp_path)
+    with pytest.raises(ValueError, match="reviewer"):
+        run({"id": "t1"}, adapter, params={"backend": "pi", "prompt": "x"}, base=tmp_path)
+    ws_root = tmp_path / ".logs" / "workspaces"
+    if ws_root.exists():
+        for ws in ws_root.iterdir():
+            assert not (ws / "AGENTS.md").exists()
+            assert not (ws / ".pi").exists()
+
+
+def test_cli_rejects_an_unknown_backend(tmp_path):
+    from hermit.agents.cli import run
+
+    with pytest.raises(ValueError, match="must be one of") as exc:
+        run({"id": "t1"}, None, params={"backend": "hermes", "prompt": "x"}, base=tmp_path)
+    msg = str(exc.value)
+    assert "codex" in msg and "pi" in msg
+    assert not (tmp_path / ".logs").exists()
+
