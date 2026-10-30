@@ -4,7 +4,7 @@ orphan: true
 
 # Roadmap: Pi as an acting agent
 
-This page is a plan. None of it is implemented. `hermit deploy --host pi` and `hermit convert --target pi` already work; training and evaluation cannot name Pi as the acting agent.
+This page is a plan. The acting-agent work below is not implemented. `hermit deploy --host pi` and `hermit convert --target pi` already work; training and evaluation cannot name Pi as the acting agent.
 
 The acting agent to add is the `pi` binary from the fork [danielsimonjr/pi](https://github.com/danielsimonjr/pi) (a fork of `earendil-works/pi`). The invocation below was read from that fork's `main` tree, under `packages/coding-agent/docs/`. Re-read those pages on the fork before coding. This repository stays the fork `danielsimonjr/hermit`. Nothing here is a change to `Infini-AI-Lab/hermit`.
 
@@ -12,10 +12,10 @@ The acting agent to add is the `pi` binary from the fork [danielsimonjr/pi](http
 
 | Piece | Where | Behavior today |
 |---|---|---|
-| Workspace deploy | `hermit/hosts/pi.py` `prepare` | Writes `AGENTS.md`, `.pi/mcp.json`, and `.pi/skills`. Called by `hermit deploy --host pi` (`hermit/cli.py`, `--host` choices `codex`, `claude-code`, `pi`). |
+| Workspace deploy | `hermit/hosts/pi.py` `prepare` | Always writes `AGENTS.md` and `.pi/mcp.json`. Copies skills into `.pi/skills` when the adapter has them (`copy_skills` returns `[]` and creates no directory otherwise). Called by `hermit deploy --host pi` (`hermit/cli.py`, `--host` choices `codex`, `claude-code`, `pi`). |
 | Role refusal | `hermit/hosts/pi.py` | An adapter whose rendered exports contain `agents` raises `ValueError` naming those roles and telling the caller to use `--host codex` or `--host claude-code`. `tests/test_deploy.py::test_pi_refuses_roles` covers that. |
 | Trust split | `hermit/hosts/pi.py` module docstring | Pi reads `AGENTS.md` with no trust prompt. `.pi/mcp.json` and `.pi/skills` load only after the project is trusted. `~/.pi/agent` is never modified. |
-| Plugin package | `hermit/plugins/pi_package.py` | `hermit convert --target pi` emits a package installed with `pi install`. A non-empty context or any roles are refused. `tests/test_convert.py::test_pi_package` covers the package. |
+| Plugin package | `hermit/plugins/pi_package.py` | `hermit convert --target pi` emits a package installed with `pi install`. A non-empty context or any roles are refused (`tests/test_convert.py::test_targets_without_context_refuse_it` covers context; roles are refused in `build` the same way). `tests/test_convert.py::test_pi_package` covers the happy-path package. |
 | Deploy tests | `tests/test_deploy.py::test_pi` | Lean template deploy writes the MCP entry, the managed `AGENTS.md` block, and `.pi/skills`, and a second deploy does not duplicate the block. |
 
 `prepare` always writes `.pi/mcp.json` (`mcpServers` is `{}` when the adapter has no tools). On the fork, any of `.pi/mcp.json`, `.pi/skills`, or `.pi/extensions` is a trust-gated resource (`packages/coding-agent/docs/security.md`). Print and JSON modes cannot show the trust prompt. With no `--approve` and no saved decision, `defaultProjectTrust` of `"ask"` (the default) skips those resources. `AGENTS.md` still loads. `--approve` / `-a` trusts them for that process only (`packages/coding-agent/docs/cli.md`). It does not write `~/.pi/agent/trust.json`.
@@ -90,8 +90,7 @@ The fork's event shapes (`packages/coding-agent/docs/json.md`, `packages/coding-
 
 **Files.**
 
-- `hermit/evolver/agent.py` `parse_log`. For `backend == "pi"`: set the session from the `session` header's `id`. For each `message_end` whose `message.role` is `assistant`, add one call and that message's `usage` only. Map `input` → `input_tokens`, `cacheRead` → `cached_input_tokens`, `output` → `output_tokens`. Set `cost_usd` from `usage.cost.total` when it is a number. Ignore `message_update` and tool-result `usage`. Leave `cacheWrite` out of `Usage` (the dataclass has nowhere to put it).
-- Before implementing the addition, record one `message_end` from the fork and see whether `usage.input` already includes `cacheRead`. `price_usage` bills `(input_tokens - cached_input_tokens)` at the input price and `cached_input_tokens` at the cached price (`hermit/evolver/agent.py`). Claude's parser adds cache reads into `input_tokens` so that formula does not drop them. The Codex fixture in `tests/test_agents.py` uses `input_tokens: 1000` and `cached_input_tokens: 200` and expects the cost to use 800 uncached tokens. Map Pi's numbers so the same formula bills uncached and cached tokens once each.
+- `hermit/evolver/agent.py` `parse_log`. For `backend == "pi"`: set the session from the `session` header's `id`. For each `message_end` whose `message.role` is `assistant`, add one call and that message's `usage` only. Pi's `usage.input` is uncached: the openai-completions parser subtracts `cacheRead` (and cache writes) from prompt tokens, the anthropic-messages parser stores `input_tokens` and `cache_read_input_tokens` separately, and the fork's `calculateCost` bills `input` and `cacheRead` apart. Map the way Claude's parser does: `input_tokens = input + cacheRead`, `cached_input_tokens = cacheRead`, `output_tokens = output`. Then `price_usage` bills `(input_tokens - cached_input_tokens)` at the input price and `cached_input_tokens` at the cached price (`hermit/evolver/agent.py`), which is uncached and cached once each. The Codex fixture in `tests/test_agents.py` uses `input_tokens: 1000` and `cached_input_tokens: 200` and expects the cost to use 800 uncached tokens. Set `cost_usd` from `usage.cost.total` when it is a number. Ignore `message_update` and tool-result `usage`. Leave `cacheWrite` out of `Usage` (the dataclass has nowhere to put it).
 - `hermit/agents/cli.py` `last_message`. For `pi`, the output is the text blocks of the last assistant `message_end`, joined. A final assistant message that has no text block yields an empty string. The JSONL file is still the trajectory.
 - Call the existing `price_usage` as `_run` does today. A `binding` whose `litellm` does not start with `anthropic/` clears a CLI-reported cost and replaces it from `params.price`. Pi's `cost.total` is that CLI-reported cost.
 
@@ -126,15 +125,16 @@ The `api` value comes from the backend's `apis` (`hermit/backends.py` `NEEDS` is
 |---|---|---|
 | `chat` | `openai-completions` | `chat` |
 | `responses`, and not `chat` | `openai-responses` | `responses` |
-| neither | no file; `problems_of` fails | |
+| `messages`, and not `chat` or `responses` | `anthropic-messages` | `messages` |
+| none of those | no file; `problems_of` fails | |
 
-Those two `api` strings are the ones the fork's models page names for OpenAI-compatible sampling. A backend that serves only `messages` fails preflight until a models.json `api` string for the Messages API is confirmed on the fork. `problems_of` already explains a missing `chat`, `responses`, or `messages` dialect; add a Pi-specific hint for this choice.
+`openai-completions` and `openai-responses` are the OpenAI-compatible `api` strings on the fork's models page (it also names `azure-openai-responses`, unused here). `anthropic-messages` is the fork's Messages API id: session-format and RPC examples use it, and the models.json loader accepts Anthropic compat plus `registerProvider(..., { api: "anthropic-messages", ... })`. `problems_of` already explains a missing `chat`, `responses`, or `messages` dialect.
 
-Built-in Pi provider names (`anthropic`, `openai`, `fireworks`, `deepseek`, and the others in the fork's providers table) are not used via `--provider` when a hermit binding exists. `--provider fireworks` would call Pi's own Fireworks endpoint, not the `base_url` in `hermit/backends.yaml`. The binding's `base_url` is `models.json` `baseUrl`.
+Built-in Pi provider names (`anthropic`, `openai`, `fireworks`, `deepseek`, and the others in the fork's providers table) are not used as the `models.json` key or via `--provider` when a hermit binding exists. A `providers.<name>` entry with `baseUrl` or `models` overlays that provider; `--provider fireworks` would select Pi's own Fireworks catalog, not the `base_url` in `hermit/backends.yaml`. The binding's `base_url` is `models.json` `baseUrl`.
 
 `apiKey` is `$` plus the binding's `api_key_env` when that variable is set. When the backend has `key_required: false` and no key is set, `apiKey` is the existing placeholder `local` (`PLACEHOLDER_KEY` in `hermit/backends.py`). The literal key never goes into params, the JSONL, or `models.json`.
 
-Model ids in this repo contain slashes (`accounts/fireworks/models/glm-5p3-flash` in `hermit/backends.yaml`). `models.json` `models[].id` stores that id whole. `--model` is `<provider>/<id>` only after a one-shot on the fork shows that a slashed id resolves; until that check, pass `--provider <name> --model <id>` as two arguments and record the fork's result in the test comment. The provider name written into `models.json` is the backend name sanitized to the character set Pi accepts for a provider key. Confirm that set on the fork; the unit test asserts the name `_run` actually wrote.
+Model ids in this repo contain slashes (`accounts/fireworks/models/glm-5p3-flash` in `hermit/backends.yaml`). `models.json` `models[].id` stores that id whole. The fork's CLI accepts `--model provider/id` and also `--provider <name>` (which requires `--model`). Pass `--provider <name> --model <id>` as two arguments so a slashed id is not parsed as part of the provider. The `models.json` provider key is an unrestricted string (built-in ids include `.` and `-`, for example `llama.cpp`). Hermit backend names are already `[A-Za-z][\w.-]*`. Use the backend name when it is not a built-in Pi provider id; otherwise a prefixed name so the binding does not overlay a built-in. The unit test asserts the name `_run` actually wrote.
 
 **Files.**
 
@@ -144,13 +144,13 @@ Model ids in this repo contain slashes (`accounts/fireworks/models/glm-5p3-flash
 
 **Tests.**
 
-- `tests/test_backends.py`: a `bind_agent_params(..., "pi", ...)` case for `vllm/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` and for `fireworks/accounts/fireworks/models/glm-5p3-flash`. Assert `baseUrl`, `api` (`openai-completions` for both; those backends list `chat` in `hermit/backends.yaml`), the `$VARIABLE` key expression, and that the returned params contain no secret. A plain model id `sonnet` is returned unchanged. Kind `"hermes"` still raises `ValueError`.
+- `tests/test_backends.py`: a `bind_agent_params(..., "pi", ...)` case for `vllm/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` and for `fireworks/accounts/fireworks/models/glm-5p3-flash`. Assert `baseUrl`, `api` (`openai-completions` for both; those backends list `chat` in `hermit/backends.yaml`), the `$VARIABLE` key expression, and that the returned params contain no secret. A third case for `anthropic/claude-x` asserts `api` is `anthropic-messages`. A plain model id `sonnet` is returned unchanged. Kind `"hermes"` still raises `ValueError`.
 - `normalize_config` with `agent.name: pi` and a top-level `model` reference fills `agent.params.binding`, and `bindings_of` yields `("agent (pi)", binding, "chat")`.
 - `tests/test_agents.py`: the fake `pi` run with a bound model asserts `models.json` under the private agent dir and asserts the child environment contains `PI_CODING_AGENT_DIR` pointing at that dir. `~/.pi/agent` is not created by the test (use a temporary `HOME`).
 
 **Acceptance.**
 
-- `hermit train` preflight rejects a Pi agent bound to a backend whose `apis` are only `messages`, with the new hint, and accepts `vllm` and `fireworks`.
+- `hermit train` preflight accepts a Pi agent bound to `vllm` and `fireworks` (`openai-completions`) and to `anthropic` (`anthropic-messages`). A backend that serves none of `chat`, `responses`, or `messages` still fails `problems_of`.
 - The key variable name is in the child environment and in the sandbox allow-list via `_model_access`. The key value appears in neither `models.json` nor `agent.params`.
 - A second task gets a new agent directory. The first directory's `models.json` is not reused.
 - Codex and Claude Code bindings in `tests/test_backends.py` keep their `args` and `env` assertions.
@@ -163,7 +163,7 @@ The fork stores saved credentials in `<agent-dir>/auth.json`. The user file is `
 
 **Files.**
 
-- `hermit/isolate.py`. Add a `pi` entry to `CLI_HOMES`: directory `.pi/agent` relative to the call's home, variable `PI_CODING_AGENT_DIR`, login file `auth.json`. `_cli_kind` then returns `pi` for `agent.name: pi` and for `agent.name: cli` with `params.backend: pi`, because `CLI_AGENTS` from item 3 maps those names and the new entry is in `CLI_HOMES`. The existing block copies `~/.pi/agent/auth.json` into `<call home>/.pi/agent/auth.json`, sets the variable, and unlinks the copy in the `finally` (mode `0o600`, same as the Codex and Claude Code copies). `program_paths("pi")` is added to the readable paths because `self.cli` is set.
+- `hermit/isolate.py`. Add a `pi` entry to `CLI_HOMES`: directory `.pi/agent` relative to the call's home, variable `PI_CODING_AGENT_DIR`, login file `auth.json`. `_cli_kind` then returns `pi` for `agent.name: pi` (`CLI_AGENTS` from item 3) and for `agent.name: cli` with `params.backend: pi` (the existing fallback uses the backend string when the name is `cli`). The new entry must be in `CLI_HOMES`. The copy block does `agent_home.mkdir()` with no `parents=True`, which is enough for `.codex` and `.claude` but not for a nested `.pi/agent`. Create that nested directory (add `parents=True`, or mkdir the parent first) so `~/.pi/agent/auth.json` can be copied to `<call home>/.pi/agent/auth.json`. Then set the variable and unlink the copy in the `finally` (mode `0o600`, same as the Codex and Claude Code copies). `program_paths("pi")` is added to the readable paths because `self.cli` is set.
 - `hermit/sandbox.py` `ALWAYS`. Add `PI_CODING_AGENT_DIR` next to `CODEX_HOME` and `CLAUDE_CONFIG_DIR`.
 - `hermit/agents/cli.py` `_run`. When `PI_CODING_AGENT_DIR` is already set (the sandbox set it), write `models.json` into that directory and do not create a second one. When the sandbox is off, keep item 3's private directory under the workspace and copy `~/.pi/agent/auth.json` into it for the call, then delete the copy. The unsandboxed Codex path uses the real `~/.codex`; Pi does not use the real `~/.pi/agent`, because item 3 writes `models.json` and the host promise forbids changing that directory.
 
@@ -191,15 +191,15 @@ The learner is still Codex or Claude Code. `evolver.name` does not gain `pi`. Sa
 - `docs/framework/task.md`, section "Built-in agents". Add a row for `pi` with the shared settings `model`, `prompt`, `files`, `args`, `env`, `price`, `timeout_s`, `workspaces`, plus the Pi-only facts: JSON mode, `--approve`, role refusal, private `PI_CODING_AGENT_DIR`.
 - `docs/framework/configuration.md`. Add `pi` to the built-in list in the opening and in the `agent.name` row of "What each section controls". State that `llm.model` still does not change the acting CLI, and that Pi takes `agent.params.model`.
 - `docs/tutorials/your-own-task.md`, section "Implement the acting pipeline". Add a short subsection: a task whose actor is Pi sets `agent.name: pi` and does not need `pipeline.py`. Show a minimal `run.yaml` fragment (`agent.name`, `agent.params.prompt`, `agent.params.model` as a `<backend>/<model id>` reference). Point at [Built-in agents](framework/task.md#built-in-agents) and at [Commands](framework/commands.md) for `deploy --host pi`. Keep the custom-pipeline path for everyone else.
-- `docs/guides/model-backends.md`. Add a row: `agent.name: pi` speaks `openai-completions` when the backend serves `chat`, otherwise `openai-responses`. Note the private `models.json`.
+- `docs/guides/model-backends.md`. Add a row: `agent.name: pi` speaks `openai-completions` when the backend serves `chat`, `openai-responses` when it serves `responses` and not `chat`, and `anthropic-messages` when it serves only `messages`. Note the private `models.json`.
 - `docs/reference/config-fields.md`. Add `pi` to the `agent.name` cell and to the paragraph that describes how a reference becomes CLI provider settings. Pi's settings go into a per-call `models.json`, not into `args` or `env` alone.
 - `docs/framework/commands.md`. The deploy and convert sections already describe Pi. Add one sentence under deploy: a training run with `agent.name: pi` deploys each task workspace the same way and then runs `pi --mode json --approve` there.
 
-**Tests.** No new Python tests. The docs build is the test, and it is the only CI job (`.github/workflows/pages.yml`).
+**Tests.** No new Python tests. The local docs build is the gate (Actions are not enabled on this fork). `.github/workflows/pages.yml` is the only workflow file; its `build` job runs `bash docs/build-pages.sh` and `python docs/check-pages.py`. `bash docs/build.sh` is the Sphinx-only html build.
 
 **Acceptance.**
 
-- `bash docs/build.sh` exits 0. Every new link uses a path that exists, including `framework/task.md#built-in-agents`.
+- `bash docs/build-pages.sh && python3 docs/check-pages.py` and `bash docs/build.sh` each exit 0. Every new link uses a path that exists, including `framework/task.md#built-in-agents`.
 - The new sentences describe the behavior items 1–4 implement. They do not describe `evolver.name: pi`.
 - `docs/framework/commands.md` still says `hermit deploy` does not launch the agent. The new sentence is about `agent.name: pi` during `train` and `eval`.
 
