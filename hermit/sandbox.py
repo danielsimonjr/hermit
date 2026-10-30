@@ -42,8 +42,8 @@ from urllib.parse import urlparse
 
 
 # Variables the framework itself sets or a program cannot start without; passed even when sandbox.env is a list.
-ALWAYS = {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "PYTHONPATH", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "HA_CONTEXT",
-          "HA_TOOL_URL"}
+ALWAYS = {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "PYTHONPATH", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+          "PI_CODING_AGENT_DIR", "HA_CONTEXT", "HA_TOOL_URL"}
 SYSTEM_ETC = ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives", "/etc/ssl", "/etc/pki",
               "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/localtime",
               "/etc/crypto-policies", "/etc/os-release")

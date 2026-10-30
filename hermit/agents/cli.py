@@ -147,7 +147,9 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
     prompt = _prompt(params, base, task)
     log, last = workspace / f"agent-{backend}.jsonl", workspace / ".last-message.txt"
     env = {**os.environ, **{k: os.path.expandvars(str(v)) for k, v in (params.get("env") or {}).items()}}
+    copied_auth = None
     if backend == "pi":
+        sandbox_agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
         agent_dir = env.get("PI_CODING_AGENT_DIR")
         if not agent_dir:
             agent_dir_path = workspace / ".pi-agent"
@@ -161,17 +163,27 @@ def _run(task: dict, adapter: Path | None, params: dict, base: Path) -> RunOutpu
             document = {provider["name"]: {"baseUrl": provider["baseUrl"], "api": provider["api"],
                                             "apiKey": provider["apiKey"], "models": provider["models"]}}
             (Path(agent_dir) / "models.json").write_text(json.dumps({"providers": document}))
+        if not sandbox_agent_dir:
+            user_auth = Path.home() / ".pi/agent/auth.json"
+            if user_auth.is_file():
+                copied_auth = Path(agent_dir) / "auth.json"
+                shutil.copy2(user_auth, copied_auth)
+                os.chmod(copied_auth, 0o600)
     started = time.time()
-    with open(log, "w") as out:
-        try:
-            # An empty stdin: the CLI reads a non-terminal stdin to its end as more prompt, and an inherited one
-            # (a shell's socket, an open pipe) may never end.
-            proc = subprocess.run(command(backend, prompt, workspace, params, last), cwd=str(workspace), env=env,
-                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                  timeout=float(params.get("timeout_s", 3600)))
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            code = -1
+    try:
+        with open(log, "w") as out:
+            try:
+                # An empty stdin: the CLI reads a non-terminal stdin to its end as more prompt, and an inherited one
+                # (a shell's socket, an open pipe) may never end.
+                proc = subprocess.run(command(backend, prompt, workspace, params, last), cwd=str(workspace), env=env,
+                                      stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                      timeout=float(params.get("timeout_s", 3600)))
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                code = -1
+    finally:
+        if copied_auth is not None:
+            copied_auth.unlink(missing_ok=True)
     wall = round(time.time() - started, 1)
     _, usage = parse_log(log, backend, params.get("model") or backend)
     price_usage(usage, params)

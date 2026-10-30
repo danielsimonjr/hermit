@@ -364,6 +364,55 @@ def test_pi_models_json_uses_a_private_agent_dir(tmp_path, monkeypatch):
     assert second_dir != first_dir
     assert not first_dir.joinpath("models.json").samefile(second_dir / "models.json")
 
+
+def test_unsandboxed_pi_copies_auth_then_deletes_it(tmp_path, monkeypatch):
+    import site
+    from test_backends import GLM, reg
+    from test_convert import variant
+    from hermit.backends import bind_agent_params
+
+    user_home = tmp_path / "userhome"
+    user_home.mkdir()
+    login = user_home / ".pi" / "agent" / "auth.json"
+    login.parent.mkdir(parents=True)
+    login.write_text('{"token":"keep"}')
+    monkeypatch.setenv("HOME", str(user_home))
+    user_site = site.getusersitepackages()
+    if user_site:
+        monkeypatch.setenv("PYTHONPATH", user_site + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "k")
+    script = FAKE_PI.replace(
+        "#!/bin/sh",
+        '#!/bin/sh\n'
+        'mode=$(stat -c \'%a\' "$PI_CODING_AGENT_DIR/auth.json" 2>/dev/null || echo missing)\n'
+        'echo "$mode" > .auth-mode\n',
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "pi").write_text(script)
+    (bin_dir / "pi").chmod(stat.S_IEXEC | stat.S_IRUSR | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    adapter = variant(tmp_path / "pi_adapter2", roles=False)
+    (tmp_path / "prompt.md").write_text("Solve {question}.")
+    run = load_pipeline("hermit.agents.cli:run", tmp_path,
+                         {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws", **bound})
+    out = run({"id": "q7", "question": "6*7"}, adapter)
+    ws = out.log
+    agent_dir = ws / ".pi-agent"
+    assert (agent_dir / "models.json").is_file()
+    assert not (agent_dir / "auth.json").exists()
+    assert login.read_text() == '{"token":"keep"}'
+    assert (ws / ".auth-mode").read_text().strip() == "600"
+    user_home2 = tmp_path / "userhome2"
+    user_home2.mkdir()
+    monkeypatch.setenv("HOME", str(user_home2))
+    out2 = run({"id": "q8", "question": "6*7"}, adapter)
+    assert (out2.log / ".pi-agent" / "models.json").is_file()
+    assert not (out2.log / ".pi-agent" / "auth.json").exists()
+
+
+def test_parse_log_pi_skips_a_truncated_line(tmp_path):
     from hermit.agents.cli import last_message
     from hermit.evolver.agent import parse_log
 

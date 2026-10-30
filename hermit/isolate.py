@@ -45,7 +45,9 @@ ROLES = ("learner", "rollout", "eval", "check", "tool")
 AGENT_ROLES = ("rollout", "eval", "check")
 WORKER = PACKAGE / "worker.py"
 PROFILE_KEYS = {"enabled", "inherit", "read", "write", "allow", "packages", "mask", "network", "env"}
-CLI_HOMES = {"codex": (".codex", "CODEX_HOME", "auth.json"), "claude": (".claude", "CLAUDE_CONFIG_DIR", ".credentials.json")}
+CLI_HOMES = {"codex": (".codex", "CODEX_HOME", "auth.json"),
+             "claude": (".claude", "CLAUDE_CONFIG_DIR", ".credentials.json"),
+             "pi": (".pi/agent", "PI_CODING_AGENT_DIR", "auth.json")}
 
 
 def profile(sandbox: dict, role: str) -> dict:
@@ -361,7 +363,7 @@ class SandboxedAgent:
         if self.cli:                                     # a CLI agent signs in with a copy of the user's login only
             folder, var, login = CLI_HOMES[self.cli]
             agent_home = home / folder
-            agent_home.mkdir()
+            agent_home.mkdir(parents=True)
             source = Path.home() / folder / login
             if source.is_file():
                 shutil.copy2(source, agent_home / login)
