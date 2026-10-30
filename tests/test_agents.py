@@ -320,6 +320,62 @@ def test_pi_timeout_sets_exit_code(tmp_path, monkeypatch, script):
     assert out.output == "" and out.tokens is None and out.cost_usd is None
 
 
+def test_pi_models_json_uses_a_private_agent_dir(tmp_path, monkeypatch):
+    from test_backends import GLM, reg
+    from test_convert import variant
+    from hermit.backends import bind_agent_params
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sekret")
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
+    _fake_pi_on_path(tmp_path, monkeypatch, FAKE_PI.replace("#!/bin/sh", '#!/bin/sh\nprintf %s "$PI_CODING_AGENT_DIR" > .pi-dir'))
+    home = _isolated_home(tmp_path, monkeypatch)
+    adapter = variant(tmp_path / "pi_adapter", roles=False)
+    (tmp_path / "prompt.md").write_text("Solve {question}.")
+    run = load_pipeline("hermit.agents.cli:run", tmp_path, {"backend": "pi", "prompt": "prompt.md", "workspaces": "ws",
+                                                             **bound})
+    first = run({"id": "q7", "question": "6*7"}, adapter).log
+    agent_dir = first / ".pi-agent"
+    assert (first / ".pi-dir").read_text() == str(agent_dir) and not (home / ".pi").exists()
+    name = bound["pi_provider"]["name"]
+    assert name == "hermit-fireworks"
+    document = (agent_dir / "models.json").read_text()
+    assert json.loads(document) == {"providers": {name: {
+        "baseUrl": "https://api.fireworks.ai/inference/v1", "api": "openai-completions",
+        "apiKey": "$FIREWORKS_API_KEY", "models": [{"id": GLM}]}}}
+    assert "sekret" not in document
+    argv = (first / ".args").read_text().splitlines()
+    assert ["--provider", name, "--model", GLM] == argv[argv.index("--provider"):][:4]
+    assert "--api-key" not in argv and "sekret" not in "".join(argv)
+    second = run({"id": "q8", "question": "6*7"}, adapter).log
+    assert (second / ".pi-agent") != agent_dir and (second / ".pi-agent" / "models.json").is_file()
+    assert (agent_dir / "models.json").read_text() == document
+
+
+def test_pi_uses_the_agent_dir_it_is_given(tmp_path, monkeypatch):
+    from test_backends import GLM, reg
+    from hermit.backends import bind_agent_params
+
+    bound = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}"}, "pi", reg())
+    _fake_pi_on_path(tmp_path, monkeypatch, FAKE_PI.replace("#!/bin/sh", '#!/bin/sh\nprintf %s "$PI_CODING_AGENT_DIR" > .pi-dir'))
+    home = _isolated_home(tmp_path, monkeypatch)
+    given = tmp_path / "elsewhere" / "agent"                  # not created yet
+    out = load_pipeline("hermit.agents.cli:run", tmp_path, {
+        "backend": "pi", "prompt": "hi", "workspaces": "ws", "env": {"PI_CODING_AGENT_DIR": str(given)},
+        **bound})({"id": "t1"}, None)
+    assert (out.log / ".pi-dir").read_text() == str(given)
+    assert (given / "models.json").is_file()
+    assert not (out.log / ".pi-agent").exists() and not (home / ".pi").exists()
+
+
+def test_pi_plain_model_writes_no_models_json(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    out = _pi_run(tmp_path, monkeypatch)
+    assert (out.log / ".pi-agent").is_dir() and not (out.log / ".pi-agent" / "models.json").exists()
+    argv = (out.log / ".args").read_text().splitlines()
+    assert "--provider" not in argv and argv[argv.index("--model") + 1] == "m1"
+
+
 def test_parse_log_pi_skips_a_truncated_line(tmp_path):
     from hermit.agents.cli import last_message
     from hermit.evolver.agent import parse_log

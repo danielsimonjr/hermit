@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from hermit import backends
-from hermit.backends import (Binding, bind_agent_params, bindings_of, is_ref, normalize_config, probe,
+from hermit.backends import (Binding, bind_agent_params, bindings_of, is_ref, normalize_config, pi_api, probe,
                                      problems_of, registry, resolve, shell_lines)
 from hermit.config import Config
 from hermit.llm import ChatClient
@@ -192,6 +192,112 @@ def test_bind_agent_params(monkeypatch):
     assert bind_agent_params({"backend": "codex"}, "codex", r) == {"backend": "codex"}
     kept = bind_agent_params({"backend": "codex", "model": "vllm/q", "price": {"input": 9}}, "codex", r)
     assert kept["price"] == {"input": 9}                                     # a price given stays
+
+
+def test_bind_pi_provider_document(monkeypatch):
+    r = reg({"vllm": {"base_url": "http://127.0.0.1:8000/v1", "key_required": False}})
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+    qwen = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    out = bind_agent_params({"backend": "pi", "model": f"vllm/{qwen}"}, "pi", r)
+    assert out["model"] == qwen
+    prov = out["pi_provider"]
+    assert prov["name"] == "vllm" and prov["baseUrl"] == "http://127.0.0.1:8000/v1"
+    assert prov["api"] == "openai-completions" and prov["apiKey"] == backends.PLACEHOLDER_KEY
+    assert "sekret" not in json.dumps(out)
+    monkeypatch.setenv("VLLM_API_KEY", "sekret")
+    out = bind_agent_params({"backend": "pi", "model": f"vllm/{qwen}"}, "pi", r)
+    assert out["pi_provider"]["apiKey"] == "$VLLM_API_KEY" and "sekret" not in json.dumps(out)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sekret")
+    out = bind_agent_params({"backend": "pi", "model": f"fireworks/{GLM}", "price": {"output": 0.5}}, "pi", reg())
+    prov = out["pi_provider"]
+    assert prov["name"] == "hermit-fireworks"
+    assert prov["baseUrl"] == "https://api.fireworks.ai/inference/v1"
+    assert prov["apiKey"] == "$FIREWORKS_API_KEY" and out["price"]["output"] == 0.5
+    assert "sekret" not in json.dumps(out)
+    anthropic = bind_agent_params({"backend": "pi", "model": "anthropic/claude-x"}, "pi", reg())
+    assert anthropic["pi_provider"]["api"] == "anthropic-messages"
+    assert anthropic["pi_provider"]["name"] == "hermit-anthropic"
+    assert anthropic["pi_provider"]["apiKey"] == "$ANTHROPIC_API_KEY"
+    responses_only = reg({"custom": {"base_url": "http://x/v1", "apis": ["responses"], "key_required": False}})
+    out = bind_agent_params({"backend": "pi", "model": "custom/m"}, "pi", responses_only)
+    assert out["pi_provider"]["api"] == "openai-responses"
+    assert pi_api(["responses"]) == ("openai-responses", "responses")
+    plain = {"backend": "pi", "model": "sonnet"}
+    assert bind_agent_params(plain, "pi", r) is plain
+    with pytest.raises(ValueError, match="kind must be codex, claude, or pi"):
+        bind_agent_params({"model": "vllm/q"}, "hermes", r)
+
+
+def test_pi_provider_name_avoids_every_builtin_pi_provider():
+    from hermit.backends import PI_BUILTIN_PROVIDERS, pi_provider_name
+
+    assert len(PI_BUILTIN_PROVIDERS) == 43                     # builtinProviders() at the pin, plus llama.cpp
+    assert {"anthropic", "openai", "deepseek", "fireworks", "llama.cpp", "radius", "zai-coding-cn"} <= PI_BUILTIN_PROVIDERS
+    assert {"vllm", "sglang", "ollama"}.isdisjoint(PI_BUILTIN_PROVIDERS)
+    assert pi_provider_name("openrouter") == "hermit-openrouter" and pi_provider_name("llama.cpp") == "hermit-llama.cpp"
+    assert pi_provider_name("vllm") == "vllm"
+    custom = reg({"together": {"base_url": "http://127.0.0.1:9/v1", "key_required": False}})
+    out = bind_agent_params({"backend": "pi", "model": "together/m"}, "pi", custom)
+    assert out["pi_provider"]["name"] == "hermit-together"
+
+
+def test_a_spec_with_no_apis_stays_empty():
+    spec = Binding.from_spec({"base_url": "http://x/v1", "model": "m", "apis": []})
+    assert spec.backend.apis == () and Binding.from_spec(spec.spec()).backend.apis == ()
+    assert Binding.from_spec({"base_url": "http://x/v1", "model": "m"}).backend.apis == ("chat",)
+
+
+def test_normalize_config_binds_a_pi_agent(monkeypatch, tmp_path):
+    monkeypatch.setenv("HA_BACKENDS", str(tmp_path / "no-user-file.yaml"))
+    data = {"model": "vllm/q", "backends": {"vllm": {"base_url": "http://127.0.0.1:8000/v1"}}, "llm": None,
+            "agent": {"name": "pi", "params": {}}}
+    normalize_config(data)
+    params = data["agent"]["params"]
+    assert params["binding"]["ref"] == "vllm/q" and "pi_provider" in params
+    agents = [row for row in bindings_of(data) if row[0].startswith("agent")]
+    assert agents == [("agent (pi)", Binding.from_spec(params["binding"]), "chat")]
+    data = {"model": "vllm/q", "backends": {"vllm": {"base_url": "http://127.0.0.1:8000/v1"}}, "llm": None,
+            "agent": {"name": "cli", "params": {"backend": "pi"}}}
+    normalize_config(data)
+    assert [row for row in bindings_of(data) if row[0].startswith("agent")][0][0] == "agent (cli)"
+
+
+def test_pi_problems_of_rejects_a_backend_with_no_dialect(tmp_path, monkeypatch):
+    from hermit.settings_check import run_check
+    from hermit.trainer.trainer import Trainer
+
+    monkeypatch.setenv("HA_BACKENDS", str(tmp_path / "no-user-file.yaml"))
+    empty = reg({"empty": {"base_url": "http://127.0.0.1:9/v1", "apis": [], "key_required": False}})
+    out = bind_agent_params({"backend": "pi", "model": "empty/m"}, "pi", empty)
+    assert "pi_provider" not in out
+    binding = Binding.from_spec(out["binding"])
+    assert problems_of(binding, "chat")
+    config = Config.load(_tiny_run(tmp_path, agent={"name": "pi", "params": {"model": "empty/m"}},
+                                         backends={"vllm": {"base_url": "http://127.0.0.1:1/v1"},
+                                                   "empty": {"base_url": "http://127.0.0.1:9/v1", "apis": [], "key_required": False}}))
+    agents = [row for row in bindings_of(config.data) if row[0].startswith("agent")]
+    assert len(agents) == 1 and agents[0][0] == "agent (pi)" and agents[0][2] == "chat"
+    assert agents[0][1].ref == "empty/m"
+    trainer = Trainer(config, log=lambda *a: None)
+    with pytest.raises(SystemExit, match="train refuses to start"):
+        trainer._prepare()
+    monkeypatch.setenv("FIREWORKS_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    assert run_check(Config.load(_tiny_run(tmp_path, agent={"name": "pi", "params": {"model": "vllm/q"}})), probe=False)
+    assert run_check(Config.load(_tiny_run(tmp_path, agent={"name": "pi", "params": {"model": f"fireworks/{GLM}"}})), probe=False)
+    assert run_check(Config.load(_tiny_run(tmp_path, agent={"name": "pi", "params": {"model": "anthropic/claude-x"}})), probe=False)
+
+
+def test_pi_model_access_lists_fireworks_endpoint(tmp_path, monkeypatch):
+    from hermit.isolate import _model_access
+
+    monkeypatch.setenv("HA_BACKENDS", str(tmp_path / "no-user-file.yaml"))
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    data = {"model": "vllm/q", "backends": {}, "llm": None,
+            "agent": {"name": "pi", "params": {"model": f"fireworks/{GLM}"}}}
+    normalize_config(data)
+    allow, keys, _ = _model_access(data)
+    assert "https://api.fireworks.ai/inference/v1" in allow and "FIREWORKS_API_KEY" in keys
 
 
 def test_claude_cost_counts_only_on_anthropic():
