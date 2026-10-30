@@ -11,6 +11,8 @@ Changes are grouped by software version. Entries under Unreleased describe work 
 - Pi JSONL event streams fill `RunOutput` tokens, cost, and `api_speed["model_calls"]` the same way Codex and Claude
   Code do.
 - Pi model references bind into a per-call `models.json` under `PI_CODING_AGENT_DIR` (not `~/.pi/agent`).
+- Sandboxed and unsandboxed Pi runs use a private agent directory for `models.json` and a ephemeral copy of
+  `~/.pi/agent/auth.json` when present.
 
 ### Breaking
 
